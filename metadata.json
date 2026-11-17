@@ -1,0 +1,6 @@
+{
+  "name": "Elegoo CC2 G-Code Cost & Wear Estimator",
+  "description": "True print cost, power consumption, filament usage, and component wear-and-tear estimator for the Elegoo Centauri Carbon 2 (CC2).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
