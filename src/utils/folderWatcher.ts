@@ -1,5 +1,6 @@
 import { ParsedGcodeData } from '../types';
 import { parseGcodeFile, syncParsedGcodeColorsWithThumbnail } from './gcodeParser';
+import { parse3mfFile } from './threemfParser';
 
 export interface FolderGcodeEntry {
   name: string;
@@ -80,7 +81,7 @@ export { GCODE_HANDLE_KEY, COST_PDF_HANDLE_KEY };
 
 export function isGcodeFileName(name: string): boolean {
   const lower = name.toLowerCase();
-  return lower.endsWith('.gcode') || lower.endsWith('.gco') || lower.endsWith('.g');
+  return lower.endsWith('.gcode') || lower.endsWith('.gco') || lower.endsWith('.g') || lower.endsWith('.3mf');
 }
 
 export async function scanDirectoryHandle(
@@ -95,9 +96,14 @@ export async function scanDirectoryHandle(
     if (entry.kind === 'file' && isGcodeFileName(entry.name)) {
       const fileHandle = entry as FileSystemFileHandle;
       const file = await fileHandle.getFile();
-      const content = await file.text();
-      const rawParsed = parseGcodeFile(content, file.name, file.size);
-      const parsed = await syncParsedGcodeColorsWithThumbnail(rawParsed);
+      let parsed: ParsedGcodeData;
+      if (file.name.toLowerCase().endsWith('.3mf')) {
+        parsed = await parse3mfFile(file, file.name);
+      } else {
+        const content = await file.text();
+        const rawParsed = parseGcodeFile(content, file.name, file.size);
+        parsed = await syncParsedGcodeColorsWithThumbnail(rawParsed);
+      }
       entries.push({
         name: file.name,
         lastModified: file.lastModified,
@@ -116,9 +122,14 @@ export async function parseFileListToFolderEntries(files: FileList): Promise<Fol
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
     if (isGcodeFileName(file.name)) {
-      const content = await file.text();
-      const rawParsed = parseGcodeFile(content, file.name, file.size);
-      const parsed = await syncParsedGcodeColorsWithThumbnail(rawParsed);
+      let parsed: ParsedGcodeData;
+      if (file.name.toLowerCase().endsWith('.3mf')) {
+        parsed = await parse3mfFile(file, file.name);
+      } else {
+        const content = await file.text();
+        const rawParsed = parseGcodeFile(content, file.name, file.size);
+        parsed = await syncParsedGcodeColorsWithThumbnail(rawParsed);
+      }
       entries.push({
         name: file.name,
         lastModified: file.lastModified,

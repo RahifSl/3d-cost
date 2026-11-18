@@ -13,9 +13,17 @@ import {
   ChevronUp,
   FolderOpen,
   RefreshCw,
-  MonitorDown,
   FileText,
-  Image as ImageIcon
+  Image as ImageIcon,
+  Layers,
+  Search,
+  Eye,
+  Bookmark,
+  Link as LinkIcon,
+  X,
+  AlertCircle,
+  Camera,
+  ArrowLeft
 } from 'lucide-react';
 import {
   ELEGOO_CC2_POWER_PROFILES,
@@ -27,6 +35,7 @@ import {
   syncParsedGcodeColorsWithThumbnail,
   formatDuration
 } from './utils/gcodeParser';
+import { parse3mfFile } from './utils/threemfParser';
 import { calculatePrintEconomics } from './utils/costCalculator';
 import {
   FolderGcodeEntry,
@@ -38,16 +47,24 @@ import {
   GCODE_HANDLE_KEY,
   COST_PDF_HANDLE_KEY
 } from './utils/folderWatcher';
-import { generateAndSavePrintCostPdf } from './utils/pdfExporter';
-import { usePWAInstall, useOnlineStatus } from './hooks/usePWAInstall';
-import { CalculationInputs, ParsedGcodeData, WearComponent } from './types';
+import { generateAndSavePrintCostPdf, generateAndSaveBatchCostPdf } from './utils/pdfExporter';
+import {
+  getAllSavedModels,
+  saveModelToLibrary,
+  deleteModelFromLibrary,
+  clearAllSavedModels,
+  updateModelThumbnailInLibrary
+} from './utils/modelLibraryStorage';
+import { fetchImageAsBase64, fileToBase64 } from './utils/imageUtils';
+import { usePWAInstall } from './hooks/usePWAInstall';
+import { BatchPrintItem, CalculationInputs, ParsedGcodeData, SavedModelItem, WearComponent } from './types';
 
 const STORAGE_KEY_INPUTS = 'elegoo_cc2_user_inputs_v4';
 const STORAGE_KEY_WEAR = 'elegoo_cc2_wear_components_v2';
 
 export default function App() {
   const [darkMode, setDarkMode] = useState<boolean>(true);
-  const [activeSection, setActiveSection] = useState<'summary' | 'wear-editor' | 'gcode-details'>('summary');
+  const [activeSection, setActiveSection] = useState<'summary' | 'model-library' | 'wear-editor' | 'gcode-details'>('summary');
   const [selectedPresetId, setSelectedPresetId] = useState<string>(SAMPLE_GCODE_PRESETS[0].id);
 
   // Initialize with the first preset (Kit Card Winter House 2-Color PLA)
@@ -134,38 +151,106 @@ export default function App() {
     }
   }, [wearComponents]);
 
-  const [isDragging, setIsDragging] = useState<boolean>(false);
-  const [inputMode, setInputMode] = useState<'folder' | 'file' | 'manual'>('file');
   const [showAdvancedSettings, setShowAdvancedSettings] = useState<boolean>(false);
   const [copiedSummary, setCopiedSummary] = useState<boolean>(false);
-  const [showDesktopGuideModal, setShowDesktopGuideModal] = useState<boolean>(false);
+  const [selectedPlateId, setSelectedPlateId] = useState<string>('all');
+  const [isParsingFile, setIsParsingFile] = useState<boolean>(false);
 
-  // Watched G-Code Input Folder State
-  const [dirHandle, setDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
-  const [savedDirHandle, setSavedDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
-  const [watchedFolderName, setWatchedFolderName] = useState<string>('');
-  const [folderFiles, setFolderFiles] = useState<FolderGcodeEntry[]>([]);
-  const [isScanningFolder, setIsScanningFolder] = useState<boolean>(false);
-  const [autoLoadNewest, setAutoLoadNewest] = useState<boolean>(true);
-  const [folderStatusMsg, setFolderStatusMsg] = useState<string>('');
-  const lastNewestTimestampRef = useRef<number>(0);
+  // Slicer & Live State
+  const [isCurrentSliceSaved, setIsCurrentSliceSaved] = useState<boolean>(false);
+  const [isSlicerConnected, setIsSlicerConnected] = useState<boolean>(false);
+  const [isScanningSlicer, setIsScanningSlicer] = useState<boolean>(false);
+  const [lastSliceTimestamp, setLastSliceTimestamp] = useState<number | null>(null);
 
   // Desktop "Cost" PDF Output Folder State
   const [costDirHandle, setCostDirHandle] = useState<FileSystemDirectoryHandle | null>(null);
   const [costFolderName, setCostFolderName] = useState<string>('');
   const [pdfExportToast, setPdfExportToast] = useState<string>('');
   const [isExportingPdf, setIsExportingPdf] = useState<boolean>(false);
+  const [pdfDocType, setPdfDocType] = useState<'workshop' | 'quote'>('workshop');
+
+  // Multi-Print Batch Queue State
+  const [showBatchModal, setShowBatchModal] = useState<boolean>(false);
+  const [batchQueue, setBatchQueue] = useState<BatchPrintItem[]>(() => {
+    try {
+      const saved = localStorage.getItem('elegoo_cc2_batch_queue_v1');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('elegoo_cc2_batch_queue_v1', JSON.stringify(batchQueue));
+    } catch {
+      // ignore
+    }
+  }, [batchQueue]);
+
+  // Saved Models Library State
+  const [savedModels, setSavedModels] = useState<SavedModelItem[]>([]);
+  const [selectedModelIds, setSelectedModelIds] = useState<Set<string>>(new Set());
+  const [librarySearchQuery, setLibrarySearchQuery] = useState<string>('');
+  const [libraryFormatFilter, setLibraryFormatFilter] = useState<'all' | '3mf' | 'gcode'>('all');
+  const [isExportingModelId, setIsExportingModelId] = useState<string | null>(null);
+
+  // Thumbnail Link & Custom Photo Modal State
+  const [showThumbnailModal, setShowThumbnailModal] = useState<boolean>(false);
+  const [thumbnailTargetModelId, setThumbnailTargetModelId] = useState<string | null>(null); // null = active print, string = library item id
+  const [thumbnailUrlInput, setThumbnailUrlInput] = useState<string>('');
+  const [thumbnailWorkingDataUrl, setThumbnailWorkingDataUrl] = useState<string | null>(null);
+  const [isLoadingThumbnailUrl, setIsLoadingThumbnailUrl] = useState<boolean>(false);
+  const [thumbnailModalError, setThumbnailModalError] = useState<string | null>(null);
+
+  // Load Saved Models from IndexedDB on startup
+  useEffect(() => {
+    let isMounted = true;
+    const loadLibrary = async () => {
+      try {
+        let models = await getAllSavedModels();
+        // If library is totally empty on first use, save initial preset model so user has something
+        if (models.length === 0) {
+          const initItem = await saveModelToLibrary(gcodeData, 'Kit Card Winter House');
+          models = [initItem];
+        }
+        if (isMounted) {
+          setSavedModels(models);
+        }
+      } catch (err) {
+        console.error('Failed to load saved models library:', err);
+      }
+    };
+    loadLibrary();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const recordModelInLibrary = async (parsed: ParsedGcodeData, title?: string) => {
+    try {
+      const saved = await saveModelToLibrary(parsed, title);
+      setSavedModels((prev) => {
+        const withoutThis = prev.filter(
+          (m) => m.id !== saved.id && m.fileName.toLowerCase() !== saved.fileName.toLowerCase()
+        );
+        return [saved, ...withoutThis];
+      });
+      return saved;
+    } catch (err) {
+      console.error('Failed to save model to library:', err);
+      return null;
+    }
+  };
 
   const [newPartName, setNewPartName] = useState<string>('');
   const [newPartCost, setNewPartCost] = useState<string>('12.00');
   const [newPartHours, setNewPartHours] = useState<string>('1000');
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const fallbackFolderInputRef = useRef<HTMLInputElement | null>(null);
   const customImageInputRef = useRef<HTMLInputElement | null>(null);
 
-  const { isInstallable, isInstalled, isInIframe, install } = usePWAInstall();
-  const isOnline = useOnlineStatus();
+  const { isInIframe } = usePWAInstall();
 
   useEffect(() => {
     const root = document.documentElement;
@@ -176,14 +261,8 @@ export default function App() {
     }
   }, [darkMode]);
 
-  // Check IndexedDB on mount for previously connected G-code folder and Desktop Cost PDF folder
+  // Check IndexedDB on mount for previously connected Desktop Cost PDF folder
   useEffect(() => {
-    loadDirectoryHandleFromIdb(GCODE_HANDLE_KEY).then((handle) => {
-      if (handle) {
-        setSavedDirHandle(handle);
-        setWatchedFolderName(handle.name);
-      }
-    });
     loadDirectoryHandleFromIdb(COST_PDF_HANDLE_KEY).then((handle) => {
       if (handle) {
         setCostDirHandle(handle);
@@ -199,13 +278,27 @@ export default function App() {
     );
   }, [inputs.powerProfileId]);
 
+  const displayedGcodeData = useMemo(() => {
+    if (!gcodeData.plates || gcodeData.plates.length <= 1 || selectedPlateId === 'all') {
+      return gcodeData;
+    }
+    const foundPlate = gcodeData.plates.find((p) => p.id === selectedPlateId);
+    if (!foundPlate) return gcodeData;
+    return {
+      ...foundPlate.gcodeData,
+      plates: gcodeData.plates,
+      is3mf: true
+    };
+  }, [gcodeData, selectedPlateId]);
+
   const report = useMemo(() => {
-    return calculatePrintEconomics(gcodeData, inputs, activePowerProfile, wearComponents);
-  }, [gcodeData, inputs, activePowerProfile, wearComponents]);
+    return calculatePrintEconomics(displayedGcodeData, inputs, activePowerProfile, wearComponents);
+  }, [displayedGcodeData, inputs, activePowerProfile, wearComponents]);
 
   // Auto-fills heating mode and abrasive setting from parsed G-code WITHOUT overwriting the user's spool price or electricity rate!
-  const applyParsedGcodeToApp = useCallback((parsed: ParsedGcodeData) => {
+  const applyParsedGcodeToApp = useCallback((parsed: ParsedGcodeData, autoSave = false) => {
     setGcodeData(parsed);
+    setSelectedPlateId('all');
     syncParsedGcodeColorsWithThumbnail(parsed).then((synced) => {
       setGcodeData((curr) => (curr.fileName === synced.fileName ? synced : curr));
     });
@@ -227,41 +320,450 @@ export default function App() {
       isAbrasiveMaterial: parsed.isAbrasiveDetected,
       powerProfileId: matchedProfileId
     }));
+
+    if (autoSave) {
+      recordModelInLibrary(parsed);
+    }
   }, []);
 
-  const handleFileUpload = (file: File) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const content = e.target?.result;
-      if (typeof content === 'string') {
-        const parsed = parseGcodeFile(content, file.name, file.size);
-        setSelectedPresetId('');
-        applyParsedGcodeToApp(parsed);
+  const handleSaveCurrentSliceToLibrary = async () => {
+    try {
+      const saved = await recordModelInLibrary(displayedGcodeData);
+      if (saved) {
+        setIsCurrentSliceSaved(true);
+        setPdfExportToast(`Saved "${saved.displayName}" to Library!`);
+        setTimeout(() => setPdfExportToast(''), 3000);
       }
-    };
-    reader.readAsText(file);
+    } catch (err) {
+      console.error('Failed to save model to library:', err);
+    }
   };
 
-  const handleCustomModelImageUpload = (file: File) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      const dataUrl = e.target?.result;
-      if (typeof dataUrl === 'string') {
-        setGcodeData((prev) => ({
-          ...prev,
-          thumbnailBase64: dataUrl
-        }));
+  const loadSliceGcode = useCallback(
+    (gcodeText: string, filename: string) => {
+      try {
+        const parsed = parseGcodeFile(gcodeText, filename || 'OrcaSlicer_Plate.gcode');
+        applyParsedGcodeToApp(parsed, false);
+        setIsCurrentSliceSaved(false);
+        setLastSliceTimestamp(Date.now());
+        setIsSlicerConnected(true);
+      } catch (err) {
+        console.error('Failed to parse sliced G-code:', err);
+      }
+    },
+    [applyParsedGcodeToApp]
+  );
+
+  const scanForLatestSlice = useCallback(async () => {
+    setIsScanningSlicer(true);
+    // 1. Try window.orca message request
+    // @ts-ignore
+    if (window.orca?.postMessage) {
+      try {
+        // @ts-ignore
+        window.orca.postMessage({ type: 'scan' });
+      } catch {}
+    }
+    // 2. Try HTTP API endpoint (works in dev mode or local server)
+    try {
+      const res = await fetch('/api/latest-slice');
+      if (res.ok) {
+        const data = await res.json();
+        const slice = data?.slice || data;
+        const gcode = slice?.gcode || slice?.content;
+        if (gcode) {
+          loadSliceGcode(gcode, slice.filename || slice.path);
+          setPdfExportToast('Loaded latest sliced plate from OrcaSlicer!');
+          setTimeout(() => setPdfExportToast(''), 3000);
+        }
+      }
+    } catch {
+      // Ignore if endpoint unreachable
+    } finally {
+      setIsScanningSlicer(false);
+    }
+  }, [loadSliceGcode]);
+
+  useEffect(() => {
+    // 0. Check window.__INITIAL_ORCA_SLICE__ injected directly by Python plugin
+    const initSlice = (window as any).__INITIAL_ORCA_SLICE__;
+    if (initSlice) {
+      const gcode = initSlice.gcode || initSlice.content;
+      if (gcode) {
+        loadSliceGcode(gcode, initSlice.filename || initSlice.path);
+      }
+    }
+
+    const handleSliceMsg = (data: any) => {
+      if (!data) return;
+      const slice = data.slice || (data.type === 'sliced' || data.type === 'slice_finished' || data.type === 'latest_slice' ? data : null);
+      if (slice) {
+        const gcode = slice.gcode || slice.content;
+        if (gcode) {
+          loadSliceGcode(gcode, slice.filename || slice.path);
+        }
       }
     };
-    reader.readAsDataURL(file);
+
+    // 1. Check window.orca (OrcaSlicer native webview integration)
+    // @ts-ignore
+    if (window.orca) {
+      setIsSlicerConnected(true);
+      // @ts-ignore
+      if (typeof window.orca.onMessage === 'function') {
+        // @ts-ignore
+        window.orca.onMessage(handleSliceMsg);
+      } else {
+        // @ts-ignore
+        window.orca.onMessage = handleSliceMsg;
+      }
+      // @ts-ignore
+      window.orca.postMessage?.({ type: 'ready' });
+    }
+
+    // 2. Window postMessage listener (iframe bridge fallback)
+    const handleWindowMsg = (event: MessageEvent) => {
+      handleSliceMsg(event.data);
+    };
+    window.addEventListener('message', handleWindowMsg);
+
+    try {
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({ fromApp: true, type: 'ready' }, '*');
+      }
+    } catch {}
+
+    // 3. Scan immediately for latest slice on startup
+    scanForLatestSlice();
+
+    return () => {
+      window.removeEventListener('message', handleWindowMsg);
+    };
+  }, [loadSliceGcode, scanForLatestSlice]);
+
+  const toggleModelSelection = (id: string) => {
+    setSelectedModelIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const handleSelectAllFilteredModels = (modelsToSelect: SavedModelItem[]) => {
+    setSelectedModelIds(new Set(modelsToSelect.map((m) => m.id)));
+  };
+
+  const handleDeselectAllModels = () => {
+    setSelectedModelIds(new Set());
+  };
+
+  const handleExportSelectedCostListPdf = async () => {
+    const selectedList = savedModels.filter((m) => selectedModelIds.has(m.id));
+    if (selectedList.length === 0) {
+      alert('Please select at least one model from the library to export.');
+      return;
+    }
+
+    setIsExportingPdf(true);
+    try {
+      let targetHandle = costDirHandle;
+      const win = window as unknown as {
+        showDirectoryPicker?: (opts?: {
+          id?: string;
+          mode?: 'read' | 'readwrite';
+          startIn?: string;
+        }) => Promise<FileSystemDirectoryHandle>;
+      };
+      if (!targetHandle && typeof win.showDirectoryPicker === 'function' && !isInIframe) {
+        targetHandle = await handleSelectCostOutputFolder();
+      }
+
+      const activePowerProfile =
+        ELEGOO_CC2_POWER_PROFILES.find((p) => p.id === inputs.powerProfileId) ||
+        ELEGOO_CC2_POWER_PROFILES[0];
+
+      const batchItems: BatchPrintItem[] = selectedList.map((m) => ({
+        id: m.id,
+        name: m.displayName,
+        fileName: m.fileName,
+        plateName: m.displayName,
+        thumbnailBase64: m.thumbnailBase64,
+        gcodeData: m.parsedData,
+        quantity: 1,
+        addedAt: Date.now()
+      }));
+
+      const result = await generateAndSaveBatchCostPdf(
+        batchItems,
+        inputs,
+        activePowerProfile,
+        wearComponents,
+        targetHandle,
+        {
+          docType: pdfDocType,
+          batchTitle: `Print Cost List & Commercial Quotation (${selectedList.length} Models)`
+        }
+      );
+
+      if (result.savedToFolder) {
+        setPdfExportToast(`Saved "${result.fileName}" directly to your "${result.folderName}" folder!`);
+      } else {
+        setPdfExportToast(`Downloaded "${result.fileName}"!`);
+      }
+      setTimeout(() => setPdfExportToast(''), 4500);
+    } finally {
+      setIsExportingPdf(false);
+    }
+  };
+
+  const handleFileUpload = async (file: File) => {
+    setIsParsingFile(true);
+    try {
+      if (file.name.toLowerCase().endsWith('.3mf')) {
+        const parsed = await parse3mfFile(file, file.name);
+        setSelectedPresetId('');
+        setSelectedPlateId('all');
+        applyParsedGcodeToApp(parsed);
+      } else {
+        const content = await file.text();
+        const parsed = parseGcodeFile(content, file.name, file.size);
+        setSelectedPresetId('');
+        setSelectedPlateId('all');
+        applyParsedGcodeToApp(parsed);
+      }
+    } catch (err) {
+      console.error('Failed to parse file:', err);
+      alert('Unable to parse file. Please verify it is a valid G-code or 3MF archive.');
+    } finally {
+      setIsParsingFile(false);
+    }
+  };
+
+  const handleFilesUpload = async (files: FileList | File[]) => {
+    if (!files || files.length === 0) return;
+    if (files.length === 1) {
+      await handleFileUpload(files[0]);
+      return;
+    }
+
+    setIsParsingFile(true);
+    const newBatchItems: BatchPrintItem[] = [];
+    try {
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        if (file.name.toLowerCase().endsWith('.3mf')) {
+          const parsed = await parse3mfFile(file, file.name);
+          await recordModelInLibrary(parsed);
+          if (parsed.plates && parsed.plates.length > 1) {
+            // Add each plate
+            for (const pl of parsed.plates) {
+              newBatchItems.push({
+                id: `batch_${Date.now()}_${i}_${pl.id}`,
+                name: `${file.name} [${pl.name}]`,
+                fileName: file.name,
+                plateName: pl.name,
+                thumbnailBase64: pl.thumbnailBase64 || parsed.thumbnailBase64,
+                gcodeData: pl.gcodeData,
+                quantity: 1,
+                addedAt: Date.now()
+              });
+            }
+          } else {
+            newBatchItems.push({
+              id: `batch_${Date.now()}_${i}`,
+              name: file.name,
+              fileName: file.name,
+              thumbnailBase64: parsed.thumbnailBase64,
+              gcodeData: parsed,
+              quantity: 1,
+              addedAt: Date.now()
+            });
+          }
+        } else {
+          const content = await file.text();
+          const parsed = parseGcodeFile(content, file.name, file.size);
+          await recordModelInLibrary(parsed);
+          newBatchItems.push({
+            id: `batch_${Date.now()}_${i}`,
+            name: file.name,
+            fileName: file.name,
+            thumbnailBase64: parsed.thumbnailBase64,
+            gcodeData: parsed,
+            quantity: 1,
+            addedAt: Date.now()
+          });
+        }
+      }
+
+      setBatchQueue((prev) => [...prev, ...newBatchItems]);
+      setShowBatchModal(true);
+      setPdfExportToast(`Added ${newBatchItems.length} prints to your Multi-Print Batch Queue!`);
+      setTimeout(() => setPdfExportToast(''), 4500);
+    } catch (err) {
+      console.error('Failed to parse multi-files:', err);
+      alert('One or more files could not be parsed.');
+    } finally {
+      setIsParsingFile(false);
+    }
+  };
+
+  const handleOpenThumbnailModal = (targetModelId: string | null = null) => {
+    setThumbnailTargetModelId(targetModelId);
+    setThumbnailUrlInput('');
+    setThumbnailModalError(null);
+    setIsLoadingThumbnailUrl(false);
+
+    if (targetModelId) {
+      const found = savedModels.find((m) => m.id === targetModelId);
+      setThumbnailWorkingDataUrl(found?.thumbnailBase64 || null);
+    } else {
+      setThumbnailWorkingDataUrl(displayedGcodeData.thumbnailBase64 || null);
+    }
+    setShowThumbnailModal(true);
+  };
+
+  const handleFetchThumbnailUrlPreview = async () => {
+    if (!thumbnailUrlInput.trim()) {
+      setThumbnailModalError('Please paste an image URL first');
+      return;
+    }
+    setIsLoadingThumbnailUrl(true);
+    setThumbnailModalError(null);
+    try {
+      const dataUrl = await fetchImageAsBase64(thumbnailUrlInput.trim());
+      setThumbnailWorkingDataUrl(dataUrl);
+    } catch (err: any) {
+      setThumbnailModalError(err.message || 'Failed to load image from link');
+    } finally {
+      setIsLoadingThumbnailUrl(false);
+    }
+  };
+
+  const handleSaveThumbnailToModel = async () => {
+    let finalDataUrl = thumbnailWorkingDataUrl;
+
+    if (thumbnailUrlInput.trim() && !finalDataUrl) {
+      setIsLoadingThumbnailUrl(true);
+      try {
+        finalDataUrl = await fetchImageAsBase64(thumbnailUrlInput.trim());
+        setThumbnailWorkingDataUrl(finalDataUrl);
+      } catch (err: any) {
+        setThumbnailModalError(err.message || 'Failed to fetch image from URL');
+        setIsLoadingThumbnailUrl(false);
+        return;
+      }
+      setIsLoadingThumbnailUrl(false);
+    }
+
+    if (!finalDataUrl) {
+      setThumbnailModalError('Please paste an image link or upload a photo first');
+      return;
+    }
+
+    try {
+      if (thumbnailTargetModelId) {
+        const updated = await updateModelThumbnailInLibrary(thumbnailTargetModelId, finalDataUrl);
+        if (updated) {
+          setSavedModels((prev) =>
+            prev.map((m) => (m.id === thumbnailTargetModelId ? { ...m, thumbnailBase64: finalDataUrl } : m))
+          );
+        }
+        if (gcodeData.fileName === updated?.fileName) {
+          setGcodeData((prev) => ({
+            ...prev,
+            thumbnailBase64: finalDataUrl
+          }));
+        }
+        setPdfExportToast('Saved new thumbnail to saved model!');
+      } else {
+        setGcodeData((prev) => ({
+          ...prev,
+          thumbnailBase64: finalDataUrl
+        }));
+        await updateModelThumbnailInLibrary(gcodeData.fileName, finalDataUrl);
+        setSavedModels((prev) =>
+          prev.map((m) =>
+            m.fileName.toLowerCase() === gcodeData.fileName.toLowerCase()
+              ? { ...m, thumbnailBase64: finalDataUrl }
+              : m
+          )
+        );
+        setPdfExportToast('Saved new thumbnail to model!');
+      }
+      setTimeout(() => setPdfExportToast(''), 3000);
+      setShowThumbnailModal(false);
+    } catch {
+      setThumbnailModalError('Failed to save thumbnail');
+    }
+  };
+
+  const handleRemoveThumbnail = async () => {
+    if (thumbnailTargetModelId) {
+      await updateModelThumbnailInLibrary(thumbnailTargetModelId, '');
+      setSavedModels((prev) =>
+        prev.map((m) => (m.id === thumbnailTargetModelId ? { ...m, thumbnailBase64: null } : m))
+      );
+    } else {
+      setGcodeData((prev) => ({
+        ...prev,
+        thumbnailBase64: null
+      }));
+      await updateModelThumbnailInLibrary(gcodeData.fileName, '');
+      setSavedModels((prev) =>
+        prev.map((m) =>
+          m.fileName.toLowerCase() === gcodeData.fileName.toLowerCase()
+            ? { ...m, thumbnailBase64: null }
+            : m
+        )
+      );
+    }
+    setShowThumbnailModal(false);
+    setPdfExportToast('Thumbnail removed.');
+    setTimeout(() => setPdfExportToast(''), 2500);
+  };
+
+  const handleCustomModelImageUpload = async (file: File) => {
+    try {
+      const dataUrl = await fileToBase64(file);
+      setThumbnailWorkingDataUrl(dataUrl);
+      setThumbnailModalError(null);
+      if (!showThumbnailModal) {
+        setGcodeData((prev) => ({ ...prev, thumbnailBase64: dataUrl }));
+        await updateModelThumbnailInLibrary(gcodeData.fileName, dataUrl);
+        setSavedModels((prev) =>
+          prev.map((m) =>
+            m.fileName.toLowerCase() === gcodeData.fileName.toLowerCase()
+              ? { ...m, thumbnailBase64: dataUrl }
+              : m
+          )
+        );
+        setPdfExportToast('Photo updated & saved to model!');
+        setTimeout(() => setPdfExportToast(''), 3000);
+      }
+    } catch {
+      setThumbnailModalError('Failed to load image file');
+    }
   };
 
   const handleSelectSamplePreset = (presetId: string) => {
     const found = SAMPLE_GCODE_PRESETS.find((p) => p.id === presetId);
     if (!found) return;
     setSelectedPresetId(presetId);
-    const parsed = parseGcodeFile(found.gcodeContent, found.fileName);
-    applyParsedGcodeToApp(parsed);
+    setSelectedPlateId('all');
+    if (found.plates && found.plates.length > 0) {
+      const parsedBase = parseGcodeFile(found.gcodeContent, found.fileName);
+      const combined: ParsedGcodeData = {
+        ...parsedBase,
+        fileName: `${found.fileName} (${found.plates.length} Printbeds)`,
+        plates: found.plates,
+        is3mf: true
+      };
+      applyParsedGcodeToApp(combined);
+    } else {
+      const parsed = parseGcodeFile(found.gcodeContent, found.fileName);
+      applyParsedGcodeToApp(parsed);
+    }
   };
 
   // Link Desktop "Cost" Folder for automatic PDF export
@@ -310,7 +812,9 @@ export default function App() {
         targetHandle = await handleSelectCostOutputFolder();
       }
 
-      const result = await generateAndSavePrintCostPdf(gcodeData, inputs, report, targetHandle);
+      const result = await generateAndSavePrintCostPdf(displayedGcodeData, inputs, report, targetHandle, {
+        docType: pdfDocType
+      });
       if (result.savedToFolder) {
         setPdfExportToast(`Saved "${result.fileName}" directly to your "${result.folderName}" folder!`);
       } else {
@@ -322,128 +826,229 @@ export default function App() {
     }
   };
 
-  // Scan an active FileSystemDirectoryHandle for G-code files
-  const refreshWatchedFolder = useCallback(
-    async (handleToScan: FileSystemDirectoryHandle, isInitialConnect = false) => {
-      try {
-        setIsScanningFolder(true);
-        const entries = await scanDirectoryHandle(handleToScan);
-        setFolderFiles(entries);
-        setFolderStatusMsg(
-          entries.length > 0
-            ? `Watching "${handleToScan.name}" (${entries.length} G-code file${entries.length === 1 ? '' : 's'})`
-            : `Connected to "${handleToScan.name}" — export a .gcode file from ElegooSlicer into this folder.`
-        );
-
-        if (entries.length > 0) {
-          const newest = entries[0];
-          if (
-            isInitialConnect ||
-            (autoLoadNewest && newest.lastModified > lastNewestTimestampRef.current)
-          ) {
-            lastNewestTimestampRef.current = newest.lastModified;
-            setSelectedPresetId('');
-            applyParsedGcodeToApp(newest.parsed);
-          }
-        }
-      } catch {
-        setFolderStatusMsg('Permission needed to re-scan folder. Click Reconnect below.');
-      } finally {
-        setIsScanningFolder(false);
-      }
-    },
-    [autoLoadNewest, applyParsedGcodeToApp]
-  );
-
-  // Connect a local G-code folder using File System Access API
-  const handleConnectLocalFolder = async () => {
-    const win = window as unknown as {
-      showDirectoryPicker?: (opts?: {
-        id?: string;
-        mode?: string;
-      }) => Promise<FileSystemDirectoryHandle>;
+  // Multi-Print Batch Handlers
+  const handleAddToBatch = (itemData: ParsedGcodeData, customTitle?: string) => {
+    const newItem: BatchPrintItem = {
+      id: `batch_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      name: customTitle || itemData.fileName,
+      fileName: itemData.fileName,
+      thumbnailBase64: itemData.thumbnailBase64,
+      gcodeData: itemData,
+      quantity: 1,
+      addedAt: Date.now()
     };
-
-    if (typeof win.showDirectoryPicker === 'function' && !isInIframe) {
-      try {
-        const handle = await win.showDirectoryPicker({
-          id: 'gcode_watch_folder',
-          mode: 'read'
-        });
-        setDirHandle(handle);
-        setSavedDirHandle(handle);
-        setWatchedFolderName(handle.name);
-        await saveDirectoryHandleToIdb(handle, GCODE_HANDLE_KEY);
-        setInputMode('folder');
-        await refreshWatchedFolder(handle, true);
-        return;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : '';
-        if (msg.toLowerCase().includes('abort')) return;
-      }
-    }
-
-    fallbackFolderInputRef.current?.click();
+    setBatchQueue((prev) => [...prev, newItem]);
+    setPdfExportToast(`Added "${newItem.name}" to Multi-Print Batch!`);
+    setTimeout(() => setPdfExportToast(''), 3500);
   };
 
-  const handleReconnectSavedFolder = async () => {
-    if (!savedDirHandle) return;
+  const handleAddAllPlatesToBatch = () => {
+    if (!gcodeData.plates || gcodeData.plates.length === 0) {
+      handleAddToBatch(gcodeData);
+      return;
+    }
+    const newItems: BatchPrintItem[] = gcodeData.plates.map((plate) => ({
+      id: `batch_${Date.now()}_${plate.id}_${Math.random().toString(36).slice(2, 6)}`,
+      name: `${gcodeData.fileName} [${plate.name}]`,
+      fileName: gcodeData.fileName,
+      plateName: plate.name,
+      thumbnailBase64: plate.thumbnailBase64 || gcodeData.thumbnailBase64,
+      gcodeData: plate.gcodeData,
+      quantity: 1,
+      addedAt: Date.now()
+    }));
+    setBatchQueue((prev) => [...prev, ...newItems]);
+    setPdfExportToast(`Added all ${newItems.length} plates to Multi-Print Batch!`);
+    setTimeout(() => setPdfExportToast(''), 4000);
+  };
+
+  const handleUpdateBatchQuantity = (id: string, delta: number) => {
+    setBatchQueue((prev) =>
+      prev.map((item) =>
+        item.id === id ? { ...item, quantity: Math.max(1, item.quantity + delta) } : item
+      )
+    );
+  };
+
+  const handleSetBatchQuantity = (id: string, qty: number) => {
+    setBatchQueue((prev) =>
+      prev.map((item) =>
+        item.id === id ? { ...item, quantity: Math.max(1, qty) } : item
+      )
+    );
+  };
+
+  const handleRemoveFromBatch = (id: string) => {
+    setBatchQueue((prev) => prev.filter((item) => item.id !== id));
+  };
+
+  const handleClearBatch = () => {
+    setBatchQueue([]);
+  };
+
+  const handleExportBatchPdf = async () => {
+    if (batchQueue.length === 0) return;
+    setIsExportingPdf(true);
     try {
-      const permHandle = savedDirHandle as unknown as {
-        requestPermission?: (opts: { mode: string }) => Promise<string>;
+      let targetHandle = costDirHandle;
+      const win = window as unknown as {
+        showDirectoryPicker?: (opts?: {
+          id?: string;
+          mode?: 'read' | 'readwrite';
+          startIn?: string;
+        }) => Promise<FileSystemDirectoryHandle>;
       };
-      if (permHandle.requestPermission) {
-        const status = await permHandle.requestPermission({ mode: 'read' });
-        if (status !== 'granted') return;
+      if (!targetHandle && typeof win.showDirectoryPicker === 'function' && !isInIframe) {
+        targetHandle = await handleSelectCostOutputFolder();
       }
-      setDirHandle(savedDirHandle);
-      setInputMode('folder');
-      await refreshWatchedFolder(savedDirHandle, true);
-    } catch {
-      handleConnectLocalFolder();
-    }
-  };
 
-  const handleFallbackFolderInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-    setIsScanningFolder(true);
-    try {
-      const firstRelPath = (files[0] as File & { webkitRelativePath?: string }).webkitRelativePath || '';
-      const folderTitle = firstRelPath.split('/')[0] || 'Selected G-Code Folder';
-      setWatchedFolderName(folderTitle);
-      const entries = await parseFileListToFolderEntries(files);
-      setFolderFiles(entries);
-      setInputMode('folder');
-      setFolderStatusMsg(
-        `Loaded ${entries.length} .gcode file${entries.length === 1 ? '' : 's'} from "${folderTitle}"`
+      const activePowerProfile =
+        ELEGOO_CC2_POWER_PROFILES.find((p) => p.id === inputs.powerProfileId) ||
+        ELEGOO_CC2_POWER_PROFILES[0];
+      const result = await generateAndSaveBatchCostPdf(
+        batchQueue,
+        inputs,
+        activePowerProfile,
+        wearComponents,
+        targetHandle,
+        {
+          docType: pdfDocType,
+          batchTitle: `Production Batch (${batchQueue.length} Print Jobs)`
+        }
       );
-      if (entries.length > 0) {
-        lastNewestTimestampRef.current = entries[0].lastModified;
-        setSelectedPresetId('');
-        applyParsedGcodeToApp(entries[0].parsed);
+      if (result.savedToFolder) {
+        setPdfExportToast(`Saved "${result.fileName}" directly to your "${result.folderName}" folder!`);
+      } else {
+        setPdfExportToast(`Downloaded "${result.fileName}"!`);
       }
+      setTimeout(() => setPdfExportToast(''), 4500);
     } finally {
-      setIsScanningFolder(false);
+      setIsExportingPdf(false);
     }
   };
 
-  useEffect(() => {
-    if (!dirHandle) return;
-    const interval = setInterval(() => {
-      refreshWatchedFolder(dirHandle, false);
-    }, 4000);
-    return () => clearInterval(interval);
-  }, [dirHandle, refreshWatchedFolder]);
+  const handleExportAllPlatesDirectPdf = async () => {
+    if (!gcodeData.plates || gcodeData.plates.length === 0) {
+      handleExportCostPdf();
+      return;
+    }
+    setIsExportingPdf(true);
+    try {
+      let targetHandle = costDirHandle;
+      const win = window as unknown as {
+        showDirectoryPicker?: (opts?: {
+          id?: string;
+          mode?: 'read' | 'readwrite';
+          startIn?: string;
+        }) => Promise<FileSystemDirectoryHandle>;
+      };
+      if (!targetHandle && typeof win.showDirectoryPicker === 'function' && !isInIframe) {
+        targetHandle = await handleSelectCostOutputFolder();
+      }
 
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file) {
-      handleFileUpload(file);
+      const activePowerProfile =
+        ELEGOO_CC2_POWER_PROFILES.find((p) => p.id === inputs.powerProfileId) ||
+        ELEGOO_CC2_POWER_PROFILES[0];
+      const plateItems: BatchPrintItem[] = gcodeData.plates.map((plate) => ({
+        id: `direct_${plate.id}`,
+        name: `${gcodeData.fileName} [${plate.name}]`,
+        fileName: gcodeData.fileName,
+        plateName: plate.name,
+        thumbnailBase64: plate.thumbnailBase64 || gcodeData.thumbnailBase64,
+        gcodeData: plate.gcodeData,
+        quantity: 1,
+        addedAt: Date.now()
+      }));
+      const result = await generateAndSaveBatchCostPdf(
+        plateItems,
+        inputs,
+        activePowerProfile,
+        wearComponents,
+        targetHandle,
+        {
+          docType: pdfDocType,
+          batchTitle: `${gcodeData.fileName} (${plateItems.length} Beds)`
+        }
+      );
+      if (result.savedToFolder) {
+        setPdfExportToast(`Saved "${result.fileName}" directly to your "${result.folderName}" folder!`);
+      } else {
+        setPdfExportToast(`Downloaded "${result.fileName}"!`);
+      }
+      setTimeout(() => setPdfExportToast(''), 4500);
+    } finally {
+      setIsExportingPdf(false);
     }
   };
+
+  // Saved Models Library Handlers
+  const handleLoadModelFromLibrary = (model: SavedModelItem) => {
+    applyParsedGcodeToApp(model.parsedData);
+    setSelectedPresetId('');
+    setSelectedPlateId('all');
+    setActiveSection('summary');
+    setPdfExportToast(`Loaded "${model.displayName}" as active print!`);
+    setTimeout(() => setPdfExportToast(''), 3000);
+  };
+
+  const handleExportModelDirectPdf = async (model: SavedModelItem, docType: 'workshop' | 'quote' = pdfDocType) => {
+    setIsExportingModelId(model.id);
+    try {
+      let targetHandle = costDirHandle;
+      const win = window as unknown as {
+        showDirectoryPicker?: (opts?: {
+          id?: string;
+          mode?: 'read' | 'readwrite';
+          startIn?: string;
+        }) => Promise<FileSystemDirectoryHandle>;
+      };
+      if (!targetHandle && typeof win.showDirectoryPicker === 'function' && !isInIframe) {
+        targetHandle = await handleSelectCostOutputFolder();
+      }
+
+      const activePowerProfile =
+        ELEGOO_CC2_POWER_PROFILES.find((p) => p.id === inputs.powerProfileId) ||
+        ELEGOO_CC2_POWER_PROFILES[0];
+      const modelReport = calculatePrintEconomics(
+        model.parsedData,
+        inputs,
+        activePowerProfile,
+        wearComponents
+      );
+      const result = await generateAndSavePrintCostPdf(
+        model.parsedData,
+        inputs,
+        modelReport,
+        targetHandle,
+        { docType }
+      );
+      if (result.savedToFolder) {
+        setPdfExportToast(`Saved "${result.fileName}" to your "${result.folderName}" folder!`);
+      } else {
+        setPdfExportToast(`Downloaded "${result.fileName}"!`);
+      }
+      setTimeout(() => setPdfExportToast(''), 4500);
+    } finally {
+      setIsExportingModelId(null);
+    }
+  };
+
+  const handleDeleteModelFromLibraryHandler = async (id: string) => {
+    await deleteModelFromLibrary(id);
+    setSavedModels((prev) => prev.filter((m) => m.id !== id));
+    setPdfExportToast('Removed model from library.');
+    setTimeout(() => setPdfExportToast(''), 2500);
+  };
+
+  const handleClearAllModelsHandler = async () => {
+    if (!confirm('Are you sure you want to remove all saved models from your library?')) return;
+    await clearAllSavedModels();
+    setSavedModels([]);
+    setPdfExportToast('Model library cleared.');
+    setTimeout(() => setPdfExportToast(''), 2500);
+  };
+
+
 
   const handleUpdateWearComponent = (
     id: string,
@@ -533,8 +1138,48 @@ export default function App() {
   const hotendComp = wearComponents.find((c) => c.id === 'hotend-complete-assembly');
   const isCompleteHotendMode = hotendComp ? hotendComp.replacementCost >= 15 : true;
 
+  const filteredModels = useMemo(() => {
+    return savedModels.filter((model) => {
+      const q = librarySearchQuery.trim().toLowerCase();
+      const matchesSearch =
+        !q ||
+        model.fileName.toLowerCase().includes(q) ||
+        model.displayName.toLowerCase().includes(q) ||
+        (model.parsedData.filamentType && model.parsedData.filamentType.toLowerCase().includes(q));
+
+      const matchesFormat =
+        libraryFormatFilter === 'all'
+          ? true
+          : libraryFormatFilter === '3mf'
+          ? model.format === '3mf'
+          : model.format === 'gcode';
+
+      return matchesSearch && matchesFormat;
+    });
+  }, [savedModels, librarySearchQuery, libraryFormatFilter]);
+
+  const handleReturnBack = () => {
+    if (activeSection !== 'summary') {
+      setActiveSection('summary');
+      return;
+    }
+
+    try {
+      // @ts-ignore
+      if (window.orca?.postMessage) {
+        // @ts-ignore
+        window.orca.postMessage({ type: 'switch_view', view: 'prepare' });
+        // @ts-ignore
+        window.orca.postMessage({ type: 'switch_to_prepare' });
+      }
+    } catch {}
+
+    setPdfExportToast('💡 To return to the 3D Plate, click the [Prepare] tab on the top bar of OrcaSlicer.');
+    setTimeout(() => setPdfExportToast(null), 5000);
+  };
+
   return (
-    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors">
+    <div className="min-h-screen w-full max-w-full overflow-x-hidden bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors">
       {/* PDF Saved Toast Notification */}
       {pdfExportToast && (
         <div className="fixed bottom-5 right-5 z-50 flex items-center gap-2.5 rounded-xl bg-emerald-600 px-4 py-3 text-xs sm:text-sm font-semibold text-white shadow-xl">
@@ -543,24 +1188,8 @@ export default function App() {
         </div>
       )}
 
-      {/* Offline Indicator Banner */}
-      {!isOnline && (
-        <div className="fixed bottom-4 left-4 z-50 flex items-center gap-2 rounded-lg bg-amber-500 px-3.5 py-2 text-xs font-semibold text-slate-950 shadow-lg">
-          <span>Offline Mode — Running locally from cached desktop app</span>
-        </div>
-      )}
 
-      {/* Hidden Fallback Directory Input for Preview Iframe */}
-      <input
-        ref={fallbackFolderInputRef}
-        type="file"
-        // @ts-expect-error webkitdirectory is standard across desktop browsers
-        webkitdirectory="true"
-        directory="true"
-        multiple
-        onChange={handleFallbackFolderInputChange}
-        className="hidden"
-      />
+
 
       {/* Hidden Custom Image Input if user wants to change the model picture */}
       <input
@@ -575,497 +1204,577 @@ export default function App() {
       />
 
       {/* Top Bar Contract: Zone 1 Brand | Zone 2 Nav Links | Zone 3 Primary Action */}
-      <header className="sticky top-0 z-30 flex items-center justify-between gap-8 px-6 py-3.5 bg-white/95 dark:bg-slate-900/95 backdrop-blur border-b border-slate-200 dark:border-slate-800">
-        <a
-          href="#top"
-          className="text-base font-bold tracking-tight text-slate-900 dark:text-slate-100 whitespace-nowrap shrink-0 font-display"
-        >
-          Elegoo CC2 Print Cost Calculator
-        </a>
+      <header className="sticky top-0 z-30 w-full max-w-full bg-white/95 dark:bg-slate-900/95 backdrop-blur border-b border-slate-200 dark:border-slate-800 px-3 sm:px-6 py-2 sm:py-2.5 transition-colors">
+        <div className="max-w-[1360px] mx-auto flex flex-col xl:flex-row xl:items-center justify-between gap-2.5 xl:gap-4">
+          {/* Top Row on < xl, Left side on >= xl: Brand and Action Buttons */}
+          <div className="flex items-center justify-between gap-3 w-full xl:w-auto">
+            <div className="flex items-center gap-2.5">
+              {/* Prominent Back Button */}
+              <button
+                type="button"
+                onClick={handleReturnBack}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-700 dark:text-amber-400 border border-amber-500/40 text-xs font-bold transition-all shadow-xs cursor-pointer group shrink-0"
+                title={activeSection === 'summary' ? 'Return to OrcaSlicer 3D Prepare plate' : 'Back to Cost Summary'}
+              >
+                <ArrowLeft className="w-3.5 h-3.5 group-hover:-translate-x-0.5 transition-transform" />
+                <span>{activeSection === 'summary' ? 'Back to Slicer' : 'Back to Summary'}</span>
+              </button>
 
-        <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600 dark:text-slate-400">
-          <button
-            type="button"
-            onClick={() => setActiveSection('summary')}
-            className={`hover:text-slate-900 dark:hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-              activeSection === 'summary'
-                ? 'text-amber-600 dark:text-amber-400 underline underline-offset-8 decoration-2'
-                : ''
-            }`}
-          >
-            Cost Summary
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveSection('wear-editor')}
-            className={`hover:text-slate-900 dark:hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-              activeSection === 'wear-editor'
-                ? 'text-amber-600 dark:text-amber-400 underline underline-offset-8 decoration-2'
-                : ''
-            }`}
-          >
-            Customize Part Lifespans
-          </button>
-          <button
-            type="button"
-            onClick={() => setActiveSection('gcode-details')}
-            className={`hover:text-slate-900 dark:hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-              activeSection === 'gcode-details'
-                ? 'text-amber-600 dark:text-amber-400 underline underline-offset-8 decoration-2'
-                : ''
-            }`}
-          >
-            G-Code Details
-          </button>
-          <button
-            type="button"
-            onClick={() => setShowDesktopGuideModal(true)}
-            className="hover:text-slate-900 dark:hover:text-white transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer text-amber-600 dark:text-amber-400"
-          >
-            <MonitorDown className="w-3.5 h-3.5" />
-            <span>{isInstalled ? 'Desktop App Active' : 'Desktop App & Folders'}</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setDarkMode(!darkMode)}
-            className="hover:text-slate-900 dark:hover:text-white transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
-          >
-            {darkMode ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
-            <span>{darkMode ? 'Light Mode' : 'Dark Mode'}</span>
-          </button>
-        </nav>
+              <div className="w-7 h-7 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-500 font-bold text-xs shrink-0 shadow-xs">
+                CC2
+              </div>
+              <div className="flex flex-col">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm sm:text-base font-bold tracking-tight text-slate-900 dark:text-slate-100 whitespace-nowrap font-display">
+                    Elegoo CC2 Cost & Wear Calculator
+                  </span>
+                  <span className="hidden sm:inline-flex px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30">
+                    OrcaSlicer Plugin
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-500 dark:text-slate-400 flex items-center gap-2">
+                  <span>Spool: <strong className="font-mono text-slate-700 dark:text-slate-300">{sym}{inputs.spoolPrice}/kg</strong></span>
+                  <span>·</span>
+                  <span>Power: <strong className="font-mono text-slate-700 dark:text-slate-300">{sym}{inputs.electricityRatePerKwh}/kWh</strong></span>
+                </div>
+              </div>
+            </div>
 
-        <div className="flex items-center gap-2.5 shrink-0">
-          <button
-            type="button"
-            onClick={handleExportCostPdf}
-            disabled={isExportingPdf}
-            className="px-4 py-2 text-xs font-semibold text-slate-950 bg-amber-500 hover:bg-amber-400 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer shadow-xs"
-          >
-            <FileText className="w-3.5 h-3.5" />
-            <span>
-              {costFolderName
-                ? `Export PDF → "${costFolderName}"`
-                : 'Export PDF to "Cost" Folder'}
-            </span>
-          </button>
+            {/* Action buttons (Batch + PDF + Dark mode) */}
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setShowBatchModal(true)}
+                className={`px-2.5 sm:px-3 py-1.5 text-xs font-semibold rounded-lg border transition-all whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer shadow-xs ${
+                  batchQueue.length > 0
+                    ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/40 hover:bg-amber-500/20'
+                    : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-300 dark:border-slate-700 hover:border-amber-500'
+                }`}
+              >
+                <Layers className="w-3.5 h-3.5 text-amber-500" />
+                <span className="hidden sm:inline">Batch Queue</span>
+                <span className="sm:hidden">Batch</span>
+                {batchQueue.length > 0 && (
+                  <span className="ml-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-amber-500 text-slate-950">
+                    {batchQueue.length}
+                  </span>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleExportCostPdf}
+                disabled={isExportingPdf}
+                className="px-2.5 sm:px-3.5 py-1.5 text-xs font-semibold text-slate-950 bg-amber-500 hover:bg-amber-400 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer shadow-xs"
+              >
+                <FileText className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">
+                  {costFolderName ? `Save PDF to "${costFolderName}"` : 'Export PDF'}
+                </span>
+                <span className="sm:hidden">PDF</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setDarkMode(!darkMode)}
+                className="p-1.5 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer shrink-0"
+                title="Toggle Theme"
+              >
+                {darkMode ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4" />}
+              </button>
+            </div>
+          </div>
+
+          {/* Navigation Tabs Bar */}
+          <nav className="flex items-center gap-1 sm:gap-2 text-xs sm:text-sm font-medium text-slate-600 dark:text-slate-400 overflow-x-auto no-scrollbar py-0.5 max-w-full">
+            <button
+              type="button"
+              onClick={() => setActiveSection('summary')}
+              className={`hover:text-slate-900 dark:hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer px-2.5 py-1 rounded-md ${
+                activeSection === 'summary'
+                  ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400 font-bold'
+                  : 'hover:bg-slate-100 dark:hover:bg-slate-800'
+              }`}
+            >
+              Cost Summary
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveSection('model-library')}
+              className={`hover:text-slate-900 dark:hover:text-white transition-colors whitespace-nowrap shrink-0 flex items-center gap-1 cursor-pointer px-2.5 py-1 rounded-md ${
+                activeSection === 'model-library'
+                  ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400 font-bold'
+                  : 'hover:bg-slate-100 dark:hover:bg-slate-800'
+              }`}
+            >
+              <Bookmark className="w-3.5 h-3.5 text-amber-500" />
+              <span>Saved Models</span>
+              {savedModels.length > 0 && (
+                <span className="px-1.5 py-0.2 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-500 border border-amber-500/30">
+                  {savedModels.length}
+                </span>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveSection('wear-editor')}
+              className={`hover:text-slate-900 dark:hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer px-2.5 py-1 rounded-md ${
+                activeSection === 'wear-editor'
+                  ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400 font-bold'
+                  : 'hover:bg-slate-100 dark:hover:bg-slate-800'
+              }`}
+            >
+              Rates & Lifespans
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveSection('gcode-details')}
+              className={`hover:text-slate-900 dark:hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer px-2.5 py-1 rounded-md ${
+                activeSection === 'gcode-details'
+                  ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400 font-bold'
+                  : 'hover:bg-slate-100 dark:hover:bg-slate-800'
+              }`}
+            >
+              G-Code Specs
+            </button>
+          </nav>
         </div>
       </header>
 
-      <main id="top" className="max-w-[1360px] mx-auto px-4 sm:px-6 py-6">
-        {/* Top Folder Connections Bar */}
-        <div className="mb-6 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:px-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div>
-            <h1 className="text-lg font-bold text-slate-900 dark:text-white">
-              Elegoo Centauri Carbon 2 — G-Code Cost & Wear Calculator
-            </h1>
-            <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400 mt-0.5">
-              Spool rate locked at <strong className="text-slate-900 dark:text-white font-mono">{sym}{inputs.spoolPrice}/kg</strong> · Power rate locked at <strong className="text-slate-900 dark:text-white font-mono">{sym}{inputs.electricityRatePerKwh}/kWh</strong>
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 shrink-0">
-            <button
-              type="button"
-              onClick={handleConnectLocalFolder}
-              className="px-3.5 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
-            >
-              <FolderOpen className="w-3.5 h-3.5 text-amber-500" />
-              <span>
-                {watchedFolderName ? `G-Code Folder: ${watchedFolderName}` : '1. Connect G-Code Input Folder'}
-              </span>
-            </button>
-
-            <button
-              type="button"
-              onClick={handleSelectCostOutputFolder}
-              className="px-3.5 py-2 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/40 text-amber-600 dark:text-amber-400 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
-            >
-              <FileText className="w-3.5 h-3.5" />
-              <span>
-                {costFolderName
-                  ? `PDF Folder: Desktop/${costFolderName}`
-                  : '2. Link Desktop "Cost" PDF Folder'}
-              </span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setShowDesktopGuideModal(true)}
-              className="px-3.5 py-2 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-600 dark:text-emerald-400 text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
-            >
-              <Download className="w-3.5 h-3.5" />
-              <span>3. Download 100% Offline Desktop App</span>
-            </button>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* LEFT SIDE (5 Columns): Simple 3-Step Guided Inputs */}
-          <div className="lg:col-span-5 space-y-5">
-            {/* STEP 1: LOAD YOUR PRINT */}
-            <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5">
-              <div className="flex items-center justify-between gap-2 mb-3">
-                <div className="flex items-center gap-2.5">
-                  <span className="w-6 h-6 rounded-full bg-amber-500 text-slate-950 font-bold text-xs flex items-center justify-center shrink-0">
-                    1
-                  </span>
-                  <h2 className="text-base font-bold text-slate-900 dark:text-white">
-                    Load Your Print
-                  </h2>
+      <main id="top" className="w-full max-w-[1360px] mx-auto px-3 sm:px-6 py-4 sm:py-6">
+        {activeSection === 'model-library' ? (
+          <div className="space-y-6">
+            {/* Library Header Bar */}
+            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 sm:p-6 shadow-xs">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <Bookmark className="w-5 h-5 text-amber-500" />
+                    <h2 className="text-xl font-bold text-slate-900 dark:text-white">
+                      Saved Models & Cost Library
+                    </h2>
+                    <span className="px-2 py-0.5 text-xs font-bold rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+                      {savedModels.length} {savedModels.length === 1 ? 'Model' : 'Models'}
+                    </span>
+                  </div>
+                  <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-400 mt-1">
+                    All imported .3MF projects and .GCODE prints are automatically saved locally. Generate instant cost sheet PDFs or reload any print at any time.
+                  </p>
                 </div>
 
-                <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  {selectedModelIds.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleExportSelectedCostListPdf}
+                      disabled={isExportingPdf}
+                      className="px-3.5 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 transition-all cursor-pointer shadow-md"
+                    >
+                      <FileText className="w-3.5 h-3.5" />
+                      <span>Export Print Cost List PDF ({selectedModelIds.size})</span>
+                    </button>
+                  )}
                   <button
                     type="button"
-                    onClick={() => setInputMode('file')}
-                    className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                      inputMode === 'file'
-                        ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
-                        : 'text-slate-600 dark:text-slate-400'
-                    }`}
+                    onClick={() => setActiveSection('summary')}
+                    className="px-3.5 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 font-semibold text-xs transition-colors cursor-pointer"
                   >
-                    Upload File
+                    Back to Calculator
+                  </button>
+                  {savedModels.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleClearAllModelsHandler}
+                      className="px-3 py-2 rounded-lg text-rose-500 hover:bg-rose-500/10 text-xs font-semibold transition-colors cursor-pointer"
+                      title="Clear all saved models from library"
+                    >
+                      Clear Library
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Search & Filter Toolbar + Multi-Selection Controls */}
+              <div className="mt-5 pt-4 border-t border-slate-200 dark:border-slate-800 flex flex-col md:flex-row items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-3 w-full md:w-auto">
+                  <div className="relative w-full sm:w-64">
+                    <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={librarySearchQuery}
+                      onChange={(e) => setLibrarySearchQuery(e.target.value)}
+                      placeholder="Search models, materials..."
+                      className="w-full pl-9 pr-3 py-1.5 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-amber-500"
+                    />
+                  </div>
+
+                  {filteredModels.length > 0 && (
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleSelectAllFilteredModels(filteredModels)}
+                        className="px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 cursor-pointer transition-colors"
+                      >
+                        Select All ({filteredModels.length})
+                      </button>
+                      {selectedModelIds.size > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleDeselectAllModels}
+                          className="text-xs text-slate-500 hover:text-slate-900 dark:hover:text-white cursor-pointer transition-colors"
+                        >
+                          Deselect All
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-1.5 w-full md:w-auto justify-end">
+                  {(['all', '3mf', 'gcode'] as const).map((fmt) => (
+                    <button
+                      key={fmt}
+                      type="button"
+                      onClick={() => setLibraryFormatFilter(fmt)}
+                      className={`px-3 py-1 text-xs font-semibold rounded-lg transition-colors cursor-pointer ${
+                        libraryFormatFilter === fmt
+                          ? 'bg-amber-500 text-slate-950'
+                          : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                      }`}
+                    >
+                      {fmt === 'all'
+                        ? `All (${savedModels.length})`
+                        : fmt === '3mf'
+                        ? `3MF (${savedModels.filter((m) => m.format === '3mf').length})`
+                        : `G-Code (${savedModels.filter((m) => m.format === 'gcode').length})`}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {/* Grid of Saved Models */}
+            {filteredModels.length === 0 ? (
+              <div className="bg-white dark:bg-slate-900 border border-dashed border-slate-300 dark:border-slate-700 rounded-xl p-12 text-center">
+                <Bookmark className="w-10 h-10 text-slate-400 mx-auto mb-3 opacity-60" />
+                <h3 className="text-base font-bold text-slate-900 dark:text-white mb-1">
+                  {savedModels.length === 0 ? 'Your Model Library is Empty' : 'No matching models found'}
+                </h3>
+                <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 max-w-md mx-auto mb-4">
+                  {savedModels.length === 0
+                    ? 'Drop any .3MF or .GCODE file into the calculator and it will automatically be saved here so you can generate cost PDFs or reload it anytime.'
+                    : 'Try clearing your search query or format filter.'}
+                </p>
+                {savedModels.length === 0 && (
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-600 text-slate-950 font-semibold text-xs inline-flex items-center gap-1.5 cursor-pointer shadow-xs"
+                  >
+                    <Upload className="w-4 h-4" />
+                    <span>Upload First Model</span>
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+                {filteredModels.map((item) => {
+                  const activePowerProfile =
+                    ELEGOO_CC2_POWER_PROFILES.find((p) => p.id === inputs.powerProfileId) ||
+                    ELEGOO_CC2_POWER_PROFILES[0];
+                  const itemReport = calculatePrintEconomics(
+                    item.parsedData,
+                    inputs,
+                    activePowerProfile,
+                    wearComponents
+                  );
+                  const isExporting = isExportingModelId === item.id;
+                  const isMultiPlate = (item.parsedData.plates && item.parsedData.plates.length > 1) || (item.platesCount ?? 1) > 1;
+                  const isSelected = selectedModelIds.has(item.id);
+
+                  return (
+                    <div
+                      key={item.id}
+                      className={`bg-white dark:bg-slate-900 border rounded-xl p-4 flex flex-col justify-between transition-all shadow-xs group ${
+                        isSelected
+                          ? 'border-amber-500 ring-2 ring-amber-500/40 bg-amber-500/[0.02]'
+                          : 'border-slate-200 dark:border-slate-800 hover:border-amber-500/50'
+                      }`}
+                    >
+                      <div>
+                        {/* Thumbnail & Format Badges */}
+                        <div className="relative w-full h-36 bg-slate-100 dark:bg-slate-950 rounded-lg overflow-hidden flex items-center justify-center border border-slate-200 dark:border-slate-800 mb-3">
+                          {item.thumbnailBase64 ? (
+                            <img
+                              src={item.thumbnailBase64}
+                              alt={item.displayName}
+                              className="w-full h-full object-contain p-2"
+                            />
+                          ) : (
+                            <div className="text-center p-4">
+                              <Layers className="w-8 h-8 text-slate-400 mx-auto mb-1 opacity-50" />
+                              <span className="text-[11px] text-slate-400 font-mono">No Preview</span>
+                            </div>
+                          )}
+
+                          {/* Multi-Select Checkbox Pill */}
+                          <label
+                            onClick={(e) => e.stopPropagation()}
+                            className={`absolute top-2 right-2 z-10 flex items-center gap-1.5 px-2 py-1 rounded-md backdrop-blur-xs border transition-colors cursor-pointer shadow-xs ${
+                              isSelected
+                                ? 'bg-amber-500 text-slate-950 font-bold border-amber-600'
+                                : 'bg-slate-900/80 text-white border-slate-700 hover:border-amber-500'
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={() => toggleModelSelection(item.id)}
+                              className="w-3.5 h-3.5 accent-slate-950 dark:accent-amber-500 rounded cursor-pointer"
+                            />
+                            <span className="text-[10px] font-semibold">{isSelected ? 'Selected' : 'Select'}</span>
+                          </label>
+
+                          <div className="absolute top-2 left-2 flex items-center gap-1">
+                            <span
+                              className={`px-2 py-0.5 text-[10px] font-extrabold rounded-md shadow-xs ${
+                                item.format === '3mf'
+                                  ? 'bg-cyan-500 text-slate-950'
+                                  : 'bg-emerald-500 text-slate-950'
+                              }`}
+                            >
+                              .{item.format.toUpperCase()}
+                            </span>
+                            {isMultiPlate && (
+                              <span className="px-2 py-0.5 text-[10px] font-bold rounded-md bg-amber-500/90 text-slate-950 shadow-xs">
+                                {item.parsedData.plates?.length || item.platesCount || 1} Beds
+                              </span>
+                            )}
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleOpenThumbnailModal(item.id);
+                            }}
+                            className="absolute bottom-2 left-2 px-2 py-0.5 text-[10px] font-semibold rounded-md bg-slate-900/80 hover:bg-amber-500 hover:text-slate-950 text-white backdrop-blur-xs flex items-center gap-1 transition-colors cursor-pointer shadow-xs"
+                            title="Add link or change thumbnail picture"
+                          >
+                            <LinkIcon className="w-3 h-3 text-amber-400" />
+                            <span>Link Photo</span>
+                          </button>
+
+                          <div className="absolute bottom-2 right-2 px-2 py-0.5 text-[10px] font-bold rounded-md bg-slate-900/80 text-white backdrop-blur-xs">
+                            {formatDuration(item.parsedData.printTimeSeconds)}
+                          </div>
+                        </div>
+
+                        {/* Name & Details */}
+                        <div className="flex items-start justify-between gap-2 mb-2">
+                          <div>
+                            <h4
+                              className="text-sm font-bold text-slate-900 dark:text-white line-clamp-1 group-hover:text-amber-500 transition-colors"
+                              title={item.displayName}
+                            >
+                              {item.displayName}
+                            </h4>
+                            <p className="text-[11px] text-slate-500 dark:text-slate-400 font-mono truncate">
+                              {item.fileName}
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteModelFromLibraryHandler(item.id)}
+                            className="p-1 text-slate-400 hover:text-rose-500 rounded-md transition-colors cursor-pointer shrink-0"
+                            title="Delete model from library"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+
+                        {/* Specs Chips */}
+                        <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-slate-600 dark:text-slate-400 mb-3">
+                          <span className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 font-mono">
+                            {item.parsedData.filamentWeightGrams.toFixed(1)}g
+                          </span>
+                          <span className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800">
+                            {item.parsedData.filamentType || 'PLA'}
+                          </span>
+                          <span className="text-[10px] text-slate-400 ml-auto">
+                            {new Date(item.importedAt).toLocaleDateString()}
+                          </span>
+                        </div>
+
+                        {/* Dynamic Cost Badges */}
+                        <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-950/80 border border-slate-200/80 dark:border-slate-800/80 mb-3 space-y-1">
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="text-slate-500 dark:text-slate-400">Total True Cost:</span>
+                            <span className="font-bold text-slate-900 dark:text-white font-mono">
+                              {sym}{itemReport.totalManufacturingCost.toFixed(2)}
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="text-amber-600 dark:text-amber-400 font-medium">Quote Price ({inputs.markupMultiplier}x markup):</span>
+                            <span className="font-bold text-amber-600 dark:text-amber-400 font-mono">
+                              {sym}{itemReport.suggestedQuotePrice.toFixed(2)}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Card Action Buttons */}
+                      <div className="grid grid-cols-2 gap-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+                        <button
+                          type="button"
+                          onClick={() => handleExportModelDirectPdf(item, 'quote')}
+                          disabled={isExporting}
+                          className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-slate-950 font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer shadow-xs"
+                          title="Generate and export cost sheet PDF"
+                        >
+                          <FileText className={`w-3.5 h-3.5 ${isExporting ? 'animate-spin' : ''}`} />
+                          <span>{isExporting ? 'Exporting...' : 'Export PDF'}</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleLoadModelFromLibrary(item)}
+                          className="px-3 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                          title="Load this model into the active calculator"
+                        >
+                          <Eye className="w-3.5 h-3.5 text-cyan-400" />
+                          <span>Load Model</span>
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          {/* LEFT SIDE (5 Columns): Simple 3-Step Guided Inputs */}
+          <div className="lg:col-span-5 space-y-5 order-2 lg:order-1">
+            {/* STEP 1: ACTIVE ORCASLICER SLICE */}
+            <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 shadow-xs">
+              <div className="flex items-center justify-between gap-2 mb-3.5">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-6 h-6 rounded-full bg-emerald-500 text-slate-950 font-bold text-xs flex items-center justify-center shrink-0">
+                    ⚡
+                  </span>
+                  <div>
+                    <h2 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                      <span>Active Slicer Plate</span>
+                      <span className="relative flex h-2 w-2">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                      </span>
+                    </h2>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={scanForLatestSlice}
+                    disabled={isScanningSlicer}
+                    className="px-2.5 py-1 text-xs font-medium rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    title="Reload newest sliced plate from OrcaSlicer"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${isScanningSlicer ? 'animate-spin' : ''}`} />
+                    <span>Re-Scan</span>
                   </button>
                   <button
                     type="button"
-                    onClick={() => setInputMode('folder')}
-                    className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                      inputMode === 'folder'
-                        ? 'bg-white dark:bg-slate-900 text-amber-600 dark:text-amber-400 shadow-xs font-semibold'
-                        : 'text-slate-600 dark:text-slate-400'
-                    }`}
+                    onClick={() => setActiveSection('model-library')}
+                    className="px-2.5 py-1 text-xs font-semibold rounded-lg bg-amber-500/10 text-amber-600 dark:text-amber-400 hover:bg-amber-500/20 flex items-center gap-1 cursor-pointer transition-colors"
                   >
-                    Watched Folder {folderFiles.length > 0 ? `(${folderFiles.length})` : ''}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setInputMode('manual')}
-                    className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                      inputMode === 'manual'
-                        ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
-                        : 'text-slate-600 dark:text-slate-400'
-                    }`}
-                  >
-                    Manual
+                    <Bookmark className="w-3 h-3 text-amber-500" />
+                    <span>Library ({savedModels.length})</span>
                   </button>
                 </div>
               </div>
 
-              {/* MODE A: UPLOAD SINGLE FILE */}
-              {inputMode === 'file' && (
-                <>
-                  <div
-                    onDragOver={(e) => {
-                      e.preventDefault();
-                      setIsDragging(true);
-                    }}
-                    onDragLeave={() => setIsDragging(false)}
-                    onDrop={handleDrop}
-                    onClick={() => fileInputRef.current?.click()}
-                    className={`border-2 border-dashed rounded-xl p-5 text-center transition-colors cursor-pointer ${
-                      isDragging
-                        ? 'border-amber-500 bg-amber-500/10'
-                        : 'border-slate-300 dark:border-slate-700 hover:border-amber-500 bg-slate-50/70 dark:bg-slate-950/60'
-                    }`}
-                  >
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      accept=".gcode,.gco,.g"
-                      onChange={(e) => {
-                        const file = e.target.files?.[0];
-                        if (file) handleFileUpload(file);
-                      }}
-                      className="hidden"
-                    />
-                    <Upload className="w-7 h-7 text-amber-500 mx-auto mb-2" />
-                    <div className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-                      Drop your <span className="font-mono text-amber-600 dark:text-amber-400">.gcode</span> file here, or click to browse
-                    </div>
-                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                      Automatically pulls model picture, total time, filament slots & temperatures
-                    </p>
+              {/* Active Slice Summary Card */}
+              <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 space-y-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <span className="text-[10px] font-mono uppercase tracking-wider text-emerald-600 dark:text-emerald-400 font-bold block">
+                      OrcaSlicer Sliced Plate
+                    </span>
+                    <h3 className="text-sm font-bold text-slate-900 dark:text-white truncate font-mono mt-0.5" title={displayedGcodeData.fileName}>
+                      {displayedGcodeData.fileName}
+                    </h3>
                   </div>
-
-                  {/* Quick Test Presets */}
-                  <div className="mt-3.5">
-                    <div className="text-xs text-slate-500 dark:text-slate-400 mb-1.5">
-                      Or test with an included Elegoo CC2 G-code preset:
-                    </div>
-                    <div className="grid grid-cols-1 gap-1.5">
-                      {SAMPLE_GCODE_PRESETS.map((preset) => {
-                        const isSelected = selectedPresetId === preset.id;
-                        return (
-                          <button
-                            key={preset.id}
-                            type="button"
-                            onClick={() => handleSelectSamplePreset(preset.id)}
-                            className={`text-left px-3 py-2 rounded-lg border text-xs transition-colors flex items-center justify-between gap-2 cursor-pointer ${
-                              isSelected
-                                ? 'bg-amber-500/10 border-amber-500/60 text-slate-900 dark:text-white font-semibold'
-                                : 'bg-slate-50 dark:bg-slate-950/50 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-400 hover:border-slate-300 dark:hover:border-slate-700'
-                            }`}
-                          >
-                            <span className="truncate">{preset.title}</span>
-                            <span className="font-mono tabular-nums text-[11px] text-slate-500 dark:text-slate-400 shrink-0">
-                              {preset.subtitle}
-                            </span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                </>
-              )}
-
-              {/* MODE B: LIVE WATCHED G-CODE FOLDER */}
-              {inputMode === 'folder' && (
-                <div className="space-y-3">
-                  <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="text-xs font-semibold text-slate-900 dark:text-white flex items-center gap-1.5">
-                        <FolderOpen className="w-4 h-4 text-amber-500 shrink-0" />
-                        <span>
-                          {watchedFolderName
-                            ? `Folder: ${watchedFolderName}`
-                            : 'Connect Your ElegooSlicer Export Folder'}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-1.5">
-                        {dirHandle && (
-                          <button
-                            type="button"
-                            onClick={() => refreshWatchedFolder(dirHandle, false)}
-                            className="px-2.5 py-1 text-xs font-medium rounded-md border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 flex items-center gap-1 cursor-pointer"
-                          >
-                            <RefreshCw className={`w-3 h-3 ${isScanningFolder ? 'animate-spin' : ''}`} />
-                            <span>Refresh</span>
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={handleConnectLocalFolder}
-                          className="px-3 py-1 text-xs font-semibold rounded-md bg-amber-500 text-slate-950 hover:bg-amber-400 transition-colors cursor-pointer"
-                        >
-                          {watchedFolderName ? 'Change Folder' : 'Choose Folder'}
-                        </button>
-                      </div>
-                    </div>
-
-                    {savedDirHandle && !dirHandle && (
-                      <div className="mt-2.5 pt-2.5 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
-                        <span className="text-xs text-slate-500 dark:text-slate-400">
-                          Previously linked folder: <strong className="text-slate-800 dark:text-slate-200">{savedDirHandle.name}</strong>
-                        </span>
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={handleReconnectSavedFolder}
-                            className="text-xs font-semibold text-amber-600 dark:text-amber-400 hover:underline cursor-pointer"
-                          >
-                            Reconnect Live Watch
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              clearDirectoryHandleFromIdb(GCODE_HANDLE_KEY);
-                              setSavedDirHandle(null);
-                              setWatchedFolderName('');
-                            }}
-                            className="text-xs text-slate-400 hover:text-rose-500 cursor-pointer"
-                          >
-                            Forget
-                          </button>
-                        </div>
-                      </div>
-                    )}
-
-                    <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-2">
-                      {folderStatusMsg ||
-                        'Select the folder where you export .gcode files from ElegooSlicer. New exports appear at the top automatically.'}
-                    </p>
-
-                    <label className="mt-2.5 pt-2.5 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between text-xs text-slate-600 dark:text-slate-300 cursor-pointer">
-                      <span>Auto-load newest exported G-code file immediately</span>
-                      <input
-                        type="checkbox"
-                        checked={autoLoadNewest}
-                        onChange={(e) => setAutoLoadNewest(e.target.checked)}
-                        className="h-3.5 w-3.5 accent-amber-500 rounded cursor-pointer"
-                      />
-                    </label>
-                  </div>
-
-                  {folderFiles.length > 0 ? (
-                    <div className="max-h-60 overflow-y-auto space-y-1.5 pr-1">
-                      {folderFiles.map((entry, idx) => {
-                        const isCurrent = gcodeData.fileName === entry.name && selectedPresetId === '';
-                        const entryCost = calculatePrintEconomics(
-                          entry.parsed,
-                          inputs,
-                          activePowerProfile,
-                          wearComponents
-                        );
-                        return (
-                          <button
-                            key={`${entry.name}-${entry.lastModified}`}
-                            type="button"
-                            onClick={() => {
-                              setSelectedPresetId('');
-                              applyParsedGcodeToApp(entry.parsed);
-                            }}
-                            className={`w-full text-left p-2.5 rounded-lg border text-xs transition-colors flex items-center justify-between gap-2.5 cursor-pointer ${
-                              isCurrent
-                                ? 'bg-amber-500/10 border-amber-500/60 text-slate-900 dark:text-white'
-                                : 'bg-slate-50 dark:bg-slate-950/60 border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700'
-                            }`}
-                          >
-                            {entry.parsed.thumbnailBase64 && (
-                              <img
-                                src={entry.parsed.thumbnailBase64}
-                                alt={entry.name}
-                                referrerPolicy="no-referrer"
-                                className="w-10 h-10 rounded object-cover bg-slate-900 border border-slate-700 shrink-0"
-                              />
-                            )}
-                            <div className="min-w-0 flex-1">
-                              <div className="font-semibold truncate flex items-center gap-1.5">
-                                {idx === 0 && (
-                                  <span className="text-[10px] font-mono uppercase text-amber-600 dark:text-amber-400 shrink-0">
-                                    [Newest]
-                                  </span>
-                                )}
-                                <span className="truncate font-mono">{entry.name}</span>
-                              </div>
-                              <div className="text-[11px] text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5">
-                                {formatDuration(entry.parsed.printTimeSeconds)} · {entry.parsed.filamentWeightGrams}g {entry.parsed.filamentType}
-                              </div>
-                            </div>
-                            <div className="text-right shrink-0 font-mono tabular-nums">
-                              <div className="text-sm font-bold text-amber-600 dark:text-amber-400">
-                                {sym}{entryCost.totalManufacturingCost.toFixed(2)}
-                              </div>
-                              <div className="text-[10px] text-slate-500 dark:text-slate-400">
-                                Fil: {sym}{entryCost.totalFilamentCost.toFixed(2)}
-                              </div>
-                            </div>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <div className="p-4 rounded-xl border border-dashed border-slate-300 dark:border-slate-800 text-center text-xs text-slate-500 dark:text-slate-400">
-                      No folder loaded yet. Click <strong>Choose Folder</strong> above to select your ElegooSlicer export folder.
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* MODE C: MANUAL TIME & WEIGHT */}
-              {inputMode === 'manual' && (
-                <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 space-y-3">
-                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                    Enter the print time and filament weight shown in your slicer preview:
-                  </p>
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                        Print Time (Hours)
-                      </label>
-                      <input
-                        type="number"
-                        step="0.25"
-                        min="0.1"
-                        value={Number((gcodeData.printTimeSeconds / 3600).toFixed(2))}
-                        onChange={(e) => {
-                          const hrs = Math.max(0.05, parseFloat(e.target.value) || 0.1);
-                          setGcodeData((prev) => ({
-                            ...prev,
-                            fileName: 'Manual_Estimate.gcode',
-                            printTimeSeconds: Math.round(hrs * 3600),
-                            modelPrintTimeSeconds: Math.round(hrs * 3600),
-                            prepareTimeSeconds: 0
-                          }));
-                        }}
-                        className="w-full px-3 py-2 text-sm font-mono tabular-nums rounded-lg bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1">
-                        Filament Weight (Grams)
-                      </label>
-                      <input
-                        type="number"
-                        step="1"
-                        min="1"
-                        value={gcodeData.filamentWeightGrams}
-                        onChange={(e) => {
-                          const g = Math.max(1, parseFloat(e.target.value) || 1);
-                          setGcodeData((prev) => ({
-                            ...prev,
-                            fileName: 'Manual_Estimate.gcode',
-                            filamentWeightGrams: g,
-                            modelFilamentGrams: g,
-                            flushedFilamentGrams: 0,
-                            towerFilamentGrams: 0,
-                            filamentSlots: []
-                          }));
-                        }}
-                        className="w-full px-3 py-2 text-sm font-mono tabular-nums rounded-lg bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700"
-                      />
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* Clear "What We Read From Your G-Code File" Box */}
-              <div className="mt-4 p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2.5">
-                <div className="text-xs font-semibold text-emerald-700 dark:text-emerald-300 flex items-center justify-between gap-2">
-                  <span className="truncate font-mono" title={gcodeData.fileName}>
-                    {gcodeData.fileName}
+                  <span className="px-2 py-0.5 text-[11px] font-bold rounded-md bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 shrink-0 font-mono">
+                    {displayedGcodeData.filamentType}
                   </span>
-                  <span className="font-mono shrink-0">{gcodeData.filamentType}</span>
                 </div>
 
-                <div className="grid grid-cols-3 gap-2 pt-2 border-t border-emerald-500/20 text-center">
-                  <div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400">Total Time</div>
-                    <div className="text-sm font-bold font-mono tabular-nums text-slate-900 dark:text-white">
-                      {formatDuration(gcodeData.printTimeSeconds)}
-                    </div>
-                    {gcodeData.prepareTimeSeconds > 0 && (
-                      <div className="text-[10px] text-slate-500 dark:text-slate-400 font-mono">
-                        ({formatDuration(gcodeData.modelPrintTimeSeconds)} print + {formatDuration(gcodeData.prepareTimeSeconds)} prep)
-                      </div>
-                    )}
-                  </div>
-                  <div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400">Total Filament</div>
-                    <div className="text-sm font-bold font-mono tabular-nums text-slate-900 dark:text-white">
-                      {gcodeData.filamentWeightGrams.toFixed(2)}g
-                    </div>
-                    <div className="text-[10px] text-slate-500 dark:text-slate-400 font-mono">
-                      {gcodeData.filamentLengthMeters}m
-                      {gcodeData.flushedFilamentGrams + gcodeData.towerFilamentGrams > 0
-                        ? ` (incl. ${(gcodeData.flushedFilamentGrams + gcodeData.towerFilamentGrams).toFixed(2)}g flush/tower)`
-                        : ''}
+                {/* Sliced Specs Pills */}
+                <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-200 dark:border-slate-800 text-center font-mono">
+                  <div className="p-2 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800/80">
+                    <div className="text-[10px] text-slate-500 dark:text-slate-400 uppercase">Print Time</div>
+                    <div className="text-xs sm:text-sm font-bold text-slate-900 dark:text-white mt-0.5">
+                      {formatDuration(displayedGcodeData.printTimeSeconds)}
                     </div>
                   </div>
-                  <div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400">Nozzle / Bed</div>
-                    <div className="text-sm font-bold font-mono tabular-nums text-slate-900 dark:text-white">
-                      {gcodeData.nozzleTempC}° / {gcodeData.bedTempC}°C
+                  <div className="p-2 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800/80">
+                    <div className="text-[10px] text-slate-500 dark:text-slate-400 uppercase">Filament</div>
+                    <div className="text-xs sm:text-sm font-bold text-amber-600 dark:text-amber-400 mt-0.5">
+                      {displayedGcodeData.filamentWeightGrams}g
                     </div>
-                    <div className="text-[10px] text-slate-500 dark:text-slate-400 font-mono">
-                      {gcodeData.nozzleDiameterMm}mm · {gcodeData.layerHeightMm}mm layer
+                  </div>
+                  <div className="p-2 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800/80">
+                    <div className="text-[10px] text-slate-500 dark:text-slate-400 uppercase">Nozzle / Bed</div>
+                    <div className="text-xs sm:text-sm font-bold text-slate-900 dark:text-white mt-0.5">
+                      {displayedGcodeData.nozzleTempC}° / {displayedGcodeData.bedTempC}°
                     </div>
                   </div>
                 </div>
 
-                {gcodeData.filamentSlots.length > 0 && (
-                  <div className="pt-2 border-t border-emerald-500/20 space-y-1">
-                    {gcodeData.filamentSlots.map((slot) => (
+                {/* Multi-bed plate selector if 3MF project with multiple plates */}
+                {gcodeData.plates && gcodeData.plates.length > 1 && (
+                  <div className="pt-2 border-t border-slate-200 dark:border-slate-800">
+                    <div className="text-[11px] font-semibold text-slate-700 dark:text-slate-300 mb-1.5 flex items-center gap-1">
+                      <Layers className="w-3.5 h-3.5 text-amber-500" />
+                      <span>Select Printbed:</span>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedPlateId('all')}
+                        className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+                          selectedPlateId === 'all'
+                            ? 'bg-amber-500 text-slate-950 font-bold'
+                            : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-400'
+                        }`}
+                      >
+                        All Beds ({gcodeData.plates.length})
+                      </button>
+                      {gcodeData.plates.map((pl) => (
+                        <button
+                          key={pl.id}
+                          type="button"
+                          onClick={() => setSelectedPlateId(pl.id)}
+                          className={`px-2.5 py-1 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+                            selectedPlateId === pl.id
+                              ? 'bg-amber-500 text-slate-950 font-bold'
+                              : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-400'
+                          }`}
+                        >
+                          {pl.name}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Multi-extruder slot breakdown */}
+                {displayedGcodeData.filamentSlots.length > 0 && (
+                  <div className="pt-2 border-t border-slate-200 dark:border-slate-800 space-y-1">
+                    {displayedGcodeData.filamentSlots.map((slot) => (
                       <div
                         key={slot.slotNumber}
                         className="flex items-center justify-between text-[11px] font-mono tabular-nums text-slate-700 dark:text-slate-300"
@@ -1086,6 +1795,54 @@ export default function App() {
                     ))}
                   </div>
                 )}
+
+                {/* Prominent Save to Library Choice Button */}
+                <div className="pt-2">
+                  {!isCurrentSliceSaved ? (
+                    <button
+                      type="button"
+                      onClick={handleSaveCurrentSliceToLibrary}
+                      className="w-full py-2.5 px-4 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-sm hover:shadow-amber-500/20 transition-all cursor-pointer"
+                    >
+                      <Plus className="w-4 h-4" />
+                      <span>Save Current Slice to Library</span>
+                    </button>
+                  ) : (
+                    <div className="w-full py-2 px-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 font-semibold text-xs flex items-center justify-center gap-2">
+                      <Check className="w-4 h-4 text-emerald-500" />
+                      <span>Saved in Library — Available for Multi-Model PDF Export</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Quick Presets Toggle for testing */}
+              <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-800">
+                <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 mb-1.5">
+                  <span>Or test with a sample model:</span>
+                </div>
+                <div className="grid grid-cols-1 gap-1">
+                  {SAMPLE_GCODE_PRESETS.slice(0, 2).map((preset) => {
+                    const isSelected = selectedPresetId === preset.id;
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        onClick={() => handleSelectSamplePreset(preset.id)}
+                        className={`text-left px-2.5 py-1.5 rounded-lg border text-xs transition-colors flex items-center justify-between gap-2 cursor-pointer ${
+                          isSelected
+                            ? 'bg-amber-500/10 border-amber-500/60 text-slate-900 dark:text-white font-semibold'
+                            : 'bg-slate-50 dark:bg-slate-950/50 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-400 hover:border-slate-300 dark:hover:border-slate-700'
+                        }`}
+                      >
+                        <span className="truncate">{preset.title}</span>
+                        <span className="font-mono tabular-nums text-[11px] text-slate-500 dark:text-slate-400 shrink-0">
+                          {preset.subtitle}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
             </section>
 
@@ -1382,7 +2139,114 @@ export default function App() {
           </div>
 
           {/* RIGHT SIDE (7 Columns): Clear Visual Cost Receipt + 3D Model Picture + PDF Export */}
-          <div className="lg:col-span-7 space-y-6">
+          <div className="lg:col-span-7 space-y-6 order-1 lg:order-2">
+            {/* MULTI-PRINTBED 3MF PROJECT BANNER / SELECTOR */}
+            {gcodeData.plates && gcodeData.plates.length > 1 && (
+              <div className="bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 border border-amber-500/40 rounded-xl p-4 shadow-sm space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <div className="p-1.5 rounded-lg bg-amber-500/20 text-amber-400">
+                      <Layers className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <div className="text-sm font-bold text-white flex items-center gap-2">
+                        Multi-Printbed 3MF Project
+                        <span className="text-[10px] font-mono font-semibold px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40">
+                          {gcodeData.plates.length} Printbeds
+                        </span>
+                      </div>
+                      <div className="text-xs text-slate-400">
+                        Select a printbed to inspect individual costs, or view the entire batch
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleExportAllPlatesDirectPdf}
+                      disabled={isExportingPdf}
+                      className="px-2.5 py-1 text-[11px] font-bold rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 transition-colors flex items-center gap-1 cursor-pointer shadow-xs"
+                    >
+                      <FileText className="w-3 h-3" />
+                      <span>Export All {gcodeData.plates.length} Beds PDF</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleAddAllPlatesToBatch}
+                      className="px-2.5 py-1 text-[11px] font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-400 border border-amber-500/30 transition-colors flex items-center gap-1 cursor-pointer shadow-xs"
+                    >
+                      <Plus className="w-3 h-3" />
+                      <span>Add All Beds to Batch</span>
+                    </button>
+                    <div className="text-right text-xs font-mono text-slate-300 pl-1">
+                      Total: <span className="font-bold text-amber-400">{formatDuration(gcodeData.printTimeSeconds)}</span> · <span className="font-bold text-emerald-400">{gcodeData.filamentWeightGrams.toFixed(1)}g</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Printbed Tab Cards */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {/* All Beds Option */}
+                  <button
+                    type="button"
+                    onClick={() => setSelectedPlateId('all')}
+                    className={`p-2.5 rounded-lg border text-left transition-all cursor-pointer ${
+                      selectedPlateId === 'all'
+                        ? 'bg-amber-500/20 border-amber-500 text-white shadow-xs'
+                        : 'bg-slate-950/60 border-slate-700/60 text-slate-300 hover:border-slate-500'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between text-xs font-bold">
+                      <span>All Printbeds</span>
+                      <span className="text-[10px] font-mono text-amber-400 font-normal">Combined</span>
+                    </div>
+                    <div className="text-[11px] font-mono text-slate-400 mt-1 flex items-center justify-between">
+                      <span>{formatDuration(gcodeData.printTimeSeconds)}</span>
+                      <span className="font-semibold text-emerald-400">{gcodeData.filamentWeightGrams.toFixed(1)}g</span>
+                    </div>
+                  </button>
+
+                  {/* Individual Beds */}
+                  {gcodeData.plates.map((plate) => {
+                    const isSelected = selectedPlateId === plate.id;
+                    return (
+                      <button
+                        key={plate.id}
+                        type="button"
+                        onClick={() => setSelectedPlateId(plate.id)}
+                        className={`p-2 rounded-lg border text-left transition-all flex items-center gap-2 cursor-pointer ${
+                          isSelected
+                            ? 'bg-amber-500/20 border-amber-500 text-white shadow-xs'
+                            : 'bg-slate-950/60 border-slate-700/60 text-slate-300 hover:border-slate-500'
+                        }`}
+                      >
+                        {plate.thumbnailBase64 ? (
+                          <img
+                            src={plate.thumbnailBase64}
+                            alt={plate.name}
+                            className="w-8 h-8 rounded object-contain bg-slate-900 border border-slate-700 shrink-0"
+                          />
+                        ) : (
+                          <div className="w-8 h-8 rounded bg-slate-800 border border-slate-700 flex items-center justify-center shrink-0 text-[10px] font-bold text-amber-400 font-mono">
+                            P{plate.index}
+                          </div>
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs font-semibold truncate" title={plate.name}>
+                            {plate.name}
+                          </div>
+                          <div className="text-[10px] font-mono text-slate-400 flex items-center justify-between">
+                            <span>{formatDuration(plate.printTimeSeconds)}</span>
+                            <span className="text-emerald-400">{plate.filamentWeightGrams.toFixed(1)}g</span>
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
             {/* MAIN VISUAL RECEIPT CARD */}
             <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6">
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-5 pb-5 border-b border-slate-200 dark:border-slate-800">
@@ -1390,10 +2254,10 @@ export default function App() {
                 <div className="flex items-center gap-4">
                   {/* Model Picture Box */}
                   <div className="relative group shrink-0">
-                    {gcodeData.thumbnailBase64 ? (
+                    {displayedGcodeData.thumbnailBase64 ? (
                       <img
-                        src={gcodeData.thumbnailBase64}
-                        alt={gcodeData.fileName}
+                        src={displayedGcodeData.thumbnailBase64}
+                        alt={displayedGcodeData.fileName}
                         referrerPolicy="no-referrer"
                         className="w-24 h-24 sm:w-28 sm:h-28 rounded-xl object-contain bg-slate-900 border border-slate-300 dark:border-slate-700 shadow-xs"
                       />
@@ -1404,18 +2268,22 @@ export default function App() {
                     )}
                     <button
                       type="button"
-                      onClick={() => customImageInputRef.current?.click()}
-                      className="mt-1.5 w-full py-1 px-2 rounded bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-[10px] font-medium text-slate-600 dark:text-slate-300 flex items-center justify-center gap-1 cursor-pointer"
-                      title="Upload custom photo or slicer screenshot"
+                      onClick={() => handleOpenThumbnailModal(null)}
+                      className="mt-1.5 w-full py-1 px-2 rounded bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-[10px] font-medium text-slate-600 dark:text-slate-300 flex items-center justify-center gap-1 cursor-pointer transition-colors"
+                      title="Add web link or upload photo for model thumbnail"
                     >
-                      <ImageIcon className="w-3 h-3" />
-                      <span>Change Photo</span>
+                      <LinkIcon className="w-3 h-3 text-amber-500" />
+                      <span>Change / Link Photo</span>
                     </button>
                   </div>
 
                   <div>
                     <span className="text-xs font-semibold uppercase tracking-wider text-amber-600 dark:text-amber-400">
-                      Total True Cost For This Print
+                      {selectedPlateId !== 'all'
+                        ? `Cost for ${displayedGcodeData.fileName}`
+                        : gcodeData.plates && gcodeData.plates.length > 1
+                          ? `Total True Cost for All ${gcodeData.plates.length} Printbeds`
+                          : 'Total True Cost For This Print'}
                     </span>
                     <div className="mt-1 flex items-baseline gap-3">
                       <span className="text-4xl sm:text-5xl font-bold tracking-tight font-mono tabular-nums text-slate-900 dark:text-white">
@@ -1423,13 +2291,39 @@ export default function App() {
                       </span>
                     </div>
                     <div className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-1">
-                      {sym}{(report.totalManufacturingCost / report.printHours).toFixed(2)}/hr · {formatDuration(gcodeData.printTimeSeconds)} · {gcodeData.filamentWeightGrams}g
+                      {sym}{(report.totalManufacturingCost / report.printHours).toFixed(2)}/hr · {formatDuration(displayedGcodeData.printTimeSeconds)} · {displayedGcodeData.filamentWeightGrams}g
                     </div>
                   </div>
                 </div>
 
                 {/* Right: Export PDF to Desktop "Cost" Folder Button + Copy Receipt */}
                 <div className="flex flex-col sm:flex-row md:flex-col gap-2 shrink-0">
+                  {/* PDF Document Type Toggle */}
+                  <div className="flex rounded-lg bg-slate-100 dark:bg-slate-800 p-0.5 text-[11px] font-semibold border border-slate-200 dark:border-slate-700">
+                    <button
+                      type="button"
+                      onClick={() => setPdfDocType('workshop')}
+                      className={`flex-1 py-1 px-2.5 rounded-md transition-colors cursor-pointer text-center ${
+                        pdfDocType === 'workshop'
+                          ? 'bg-amber-500 text-slate-950 shadow-xs'
+                          : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                      }`}
+                    >
+                      Workshop Report
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPdfDocType('quote')}
+                      className={`flex-1 py-1 px-2.5 rounded-md transition-colors cursor-pointer text-center ${
+                        pdfDocType === 'quote'
+                          ? 'bg-amber-500 text-slate-950 shadow-xs'
+                          : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                      }`}
+                    >
+                      Client Quote
+                    </button>
+                  </div>
+
                   <button
                     type="button"
                     onClick={handleExportCostPdf}
@@ -1439,10 +2333,33 @@ export default function App() {
                     <FileText className="w-4 h-4" />
                     <span>
                       {costFolderName
-                        ? `Save PDF to "${costFolderName}" Folder`
-                        : 'Export PDF to "Cost" Folder'}
+                        ? `Save ${pdfDocType === 'quote' ? 'Quotation' : 'Report'} to "${costFolderName}"`
+                        : `Export ${pdfDocType === 'quote' ? 'Quotation' : 'Cost Report'} PDF`}
                     </span>
                   </button>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleAddToBatch(displayedGcodeData)}
+                      className="flex-1 py-1.5 px-2.5 text-[11px] font-semibold rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700 transition-colors flex items-center justify-center gap-1 cursor-pointer"
+                    >
+                      <Plus className="w-3.5 h-3.5 text-amber-500" />
+                      <span>Add to Batch</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowBatchModal(true)}
+                      className={`flex-1 py-1.5 px-2.5 text-[11px] font-semibold rounded-lg border transition-colors flex items-center justify-center gap-1 cursor-pointer ${
+                        batchQueue.length > 0
+                          ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/40 hover:bg-amber-500/20'
+                          : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-300 dark:border-slate-700 hover:border-amber-500'
+                      }`}
+                    >
+                      <Layers className="w-3.5 h-3.5 text-amber-500" />
+                      <span>Batch ({batchQueue.length})</span>
+                    </button>
+                  </div>
 
                   <div className="flex items-center gap-2">
                     <button
@@ -1684,6 +2601,14 @@ export default function App() {
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setActiveSection('summary')}
+                      className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400 border border-amber-500/30 text-xs font-semibold transition-colors cursor-pointer"
+                    >
+                      <ArrowLeft className="w-3.5 h-3.5" />
+                      <span>Back to Summary</span>
+                    </button>
                     <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg text-xs">
                       <button
                         type="button"
@@ -1851,13 +2776,23 @@ export default function App() {
             {/* VIEW 3: FULL SLICER & G-CODE TECHNICAL DETAILS */}
             {activeSection === 'gcode-details' && (
               <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 space-y-5">
-                <div>
-                  <h3 className="text-base font-bold text-slate-900 dark:text-white mb-1">
-                    All Parameters Extracted From Your G-Code File
-                  </h3>
-                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                    Complete slicer metadata read from <span className="font-mono">{gcodeData.fileName}</span>:
-                  </p>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-base font-bold text-slate-900 dark:text-white mb-1">
+                      All Parameters Extracted From Your G-Code File
+                    </h3>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      Complete slicer metadata read from <span className="font-mono">{gcodeData.fileName}</span>:
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setActiveSection('summary')}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400 border border-amber-500/30 text-xs font-semibold transition-colors cursor-pointer shrink-0 self-start sm:self-auto"
+                  >
+                    <ArrowLeft className="w-3.5 h-3.5" />
+                    <span>Back to Cost Summary</span>
+                  </button>
                 </div>
 
                 {gcodeData.filamentSlots.length > 0 && (
@@ -1966,92 +2901,496 @@ export default function App() {
             )}
           </div>
         </div>
-      </main>
+      )}
+    </main>
 
-      {/* Desktop PWA & Standalone Offline App Modal */}
-      {showDesktopGuideModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 p-4">
-          <div className="w-full max-w-xl rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 shadow-xl space-y-4">
-            <div className="flex items-center justify-between">
-              <h3 className="text-lg font-bold text-slate-900 dark:text-white">
-                100% Offline Windows Desktop App & Folder Setup
-              </h3>
+      {/* Model Thumbnail Picture & Web Link Modal */}
+      {showThumbnailModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-xs p-4 animate-in fade-in duration-200">
+          <div className="w-full max-w-lg rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 shadow-2xl space-y-5">
+            {/* Header */}
+            <div className="flex items-center justify-between pb-3 border-b border-slate-200 dark:border-slate-800">
+              <div className="flex items-center gap-2">
+                <Camera className="w-5 h-5 text-amber-500" />
+                <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                  {thumbnailTargetModelId
+                    ? `Set Thumbnail: ${savedModels.find((m) => m.id === thumbnailTargetModelId)?.displayName || 'Model'}`
+                    : `Set Thumbnail: ${displayedGcodeData.fileName}`}
+                </h3>
+              </div>
               <button
                 type="button"
-                onClick={() => setShowDesktopGuideModal(false)}
-                className="text-xs text-slate-500 hover:text-slate-900 dark:hover:text-white cursor-pointer"
+                onClick={() => setShowThumbnailModal(false)}
+                className="p-1 rounded-lg text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
               >
-                Close
+                <X className="w-4 h-4" />
               </button>
             </div>
 
-            <div className="space-y-3 text-xs sm:text-sm text-slate-600 dark:text-slate-300">
-              <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2.5">
-                <div className="font-bold text-emerald-600 dark:text-emerald-400">
-                  Option A (Recommended): 100% Local Offline Desktop App (Zero Cloud Server)
-                </div>
-                <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-                  Download both files below into a folder on your PC (e.g. on your Desktop). Double-click <strong>Elegoo_CC2_Offline_Launcher.bat</strong> to open the app in a standalone Windows desktop window running 100% off your hard drive — no internet or cloud server ever needed, and full live folder watching + direct PDF saving to <code className="font-mono">Desktop\Cost</code> remain enabled:
-                </p>
-                <div className="flex flex-wrap items-center gap-2 pt-1">
-                  <a
-                    href="/Elegoo_CC2_Cost_Calculator_Offline.html"
-                    download="Elegoo_CC2_Cost_Calculator_Offline.html"
-                    className="px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-xs flex items-center gap-1.5 transition-colors"
-                  >
-                    <Download className="w-3.5 h-3.5" />
-                    <span>1. Download Offline App (.html)</span>
-                  </a>
-                  <a
-                    href="/Elegoo_CC2_Offline_Launcher.bat"
-                    download="Elegoo_CC2_Offline_Launcher.bat"
-                    className="px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-white border border-slate-700 font-semibold text-xs flex items-center gap-1.5 transition-colors"
-                  >
-                    <MonitorDown className="w-3.5 h-3.5 text-amber-400" />
-                    <span>2. Download Windows Window Launcher (.bat)</span>
-                  </a>
-                </div>
-              </div>
-
-              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
-                <div className="font-semibold text-slate-900 dark:text-white mb-1">
-                  Link Your Desktop "Cost" Folder & ElegooSlicer Folder
-                </div>
-                <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                  Use <strong>1. Connect G-Code Input Folder</strong> to watch your ElegooSlicer export folder, and <strong>2. Link Desktop "Cost" PDF Folder</strong> to automatically save <code className="font-mono">&lt;PrintName&gt;_Cost_Report.pdf</code> straight into your Desktop <code className="font-mono">Cost</code> folder.
-                </p>
-              </div>
-
-              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
-                <div className="font-semibold text-slate-900 dark:text-white mb-1">
-                  Option B: Install Browser PWA Shortcut
-                </div>
-                {isInstallable ? (
-                  <button
-                    type="button"
-                    onClick={install}
-                    className="mt-1.5 px-4 py-2 text-xs font-semibold text-slate-950 bg-amber-500 hover:bg-amber-400 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <MonitorDown className="w-3.5 h-3.5" />
-                    <span>Click Here to Install Browser PWA</span>
-                  </button>
+            {/* Live Preview Box */}
+            <div className="flex flex-col items-center justify-center">
+              <div className="relative w-48 h-48 rounded-xl bg-slate-100 dark:bg-slate-950 border-2 border-dashed border-slate-300 dark:border-slate-700 overflow-hidden flex items-center justify-center shadow-inner">
+                {isLoadingThumbnailUrl ? (
+                  <div className="flex flex-col items-center gap-2 p-4 text-center">
+                    <RefreshCw className="w-8 h-8 text-amber-500 animate-spin" />
+                    <span className="text-xs text-amber-500 font-medium">Fetching & converting image from link...</span>
+                  </div>
+                ) : thumbnailWorkingDataUrl ? (
+                  <img
+                    src={thumbnailWorkingDataUrl}
+                    alt="Thumbnail Preview"
+                    className="w-full h-full object-contain p-2"
+                  />
                 ) : (
-                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                    In Chrome, click the <strong>3 dots menu (⋮)</strong> at the top-right → <strong>Cast, save, and share</strong> → <strong>Install page as app...</strong>
-                  </p>
+                  <div className="flex flex-col items-center gap-2 text-slate-400 p-4 text-center">
+                    <ImageIcon className="w-10 h-10 opacity-40" />
+                    <span className="text-xs font-medium">No Thumbnail Set</span>
+                    <span className="text-[11px] text-slate-500">Paste an image link or upload a file below</span>
+                  </div>
                 )}
               </div>
             </div>
 
-            <div className="flex justify-end gap-2 pt-2">
+            {/* Method 1: Web Link / Image URL */}
+            <div className="space-y-2">
+              <label className="text-xs font-bold text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
+                <LinkIcon className="w-3.5 h-3.5 text-amber-500" />
+                <span>Image Web Link (URL)</span>
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="url"
+                  value={thumbnailUrlInput}
+                  onChange={(e) => {
+                    setThumbnailUrlInput(e.target.value);
+                    if (thumbnailModalError) setThumbnailModalError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      handleFetchThumbnailUrlPreview();
+                    }
+                  }}
+                  placeholder="https://... (MakerWorld, Printables, Google, Imgur...)"
+                  className="flex-1 px-3 py-2 text-xs rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-amber-500 font-mono"
+                />
+                <button
+                  type="button"
+                  onClick={handleFetchThumbnailUrlPreview}
+                  disabled={isLoadingThumbnailUrl || !thumbnailUrlInput.trim()}
+                  className="px-3.5 py-2 text-xs font-semibold rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 transition-colors shrink-0 cursor-pointer shadow-xs"
+                >
+                  {isLoadingThumbnailUrl ? 'Loading...' : 'Preview Link'}
+                </button>
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                Works with any image URL. It will automatically download, convert to base64, and embed permanently into the model and exported PDFs.
+              </p>
+            </div>
+
+            {/* Method 2: Upload File Alternative */}
+            <div className="pt-2 border-t border-slate-200 dark:border-slate-800 flex items-center justify-between text-xs">
+              <span className="text-slate-500 dark:text-slate-400">Or choose a local photo:</span>
               <button
                 type="button"
-                onClick={() => setShowDesktopGuideModal(false)}
-                className="px-4 py-2 text-xs font-semibold text-slate-950 bg-amber-500 hover:bg-amber-400 rounded-lg transition-colors cursor-pointer"
+                onClick={() => customImageInputRef.current?.click()}
+                className="px-3 py-1.5 rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300 font-medium flex items-center gap-1.5 transition-colors cursor-pointer"
               >
-                Got It
+                <Upload className="w-3.5 h-3.5 text-amber-500" />
+                <span>Upload Image File (.png, .jpg)</span>
               </button>
             </div>
+
+            {/* Error Message */}
+            {thumbnailModalError && (
+              <div className="p-3 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-500 text-xs flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{thumbnailModalError}</span>
+              </div>
+            )}
+
+            {/* Footer Buttons */}
+            <div className="flex items-center justify-between pt-3 border-t border-slate-200 dark:border-slate-800">
+              {thumbnailWorkingDataUrl ? (
+                <button
+                  type="button"
+                  onClick={handleRemoveThumbnail}
+                  className="text-xs text-rose-500 hover:text-rose-600 font-semibold cursor-pointer"
+                >
+                  Remove Thumbnail
+                </button>
+              ) : (
+                <div />
+              )}
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowThumbnailModal(false)}
+                  className="px-3.5 py-1.5 text-xs font-semibold rounded-lg text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSaveThumbnailToModel}
+                  disabled={isLoadingThumbnailUrl || (!thumbnailWorkingDataUrl && !thumbnailUrlInput.trim())}
+                  className="px-4 py-2 text-xs font-bold rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 transition-colors cursor-pointer shadow-xs flex items-center gap-1.5"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>Save to Model</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+
+
+      {/* MULTI-PRINT BATCH QUEUE & QUOTATION MODAL */}
+      {showBatchModal && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl max-w-4xl w-full max-h-[92vh] flex flex-col shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+            {/* Modal Header */}
+            <div className="p-4 sm:px-6 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-3 bg-slate-50/70 dark:bg-slate-950/60">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-amber-500/20 text-amber-500 shrink-0">
+                  <Layers className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h2 className="text-base sm:text-lg font-bold text-slate-900 dark:text-white">
+                      Multi-Print Production Batch
+                    </h2>
+                    <span className="text-xs font-mono font-semibold px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-500 border border-amber-500/30">
+                      {batchQueue.length} {batchQueue.length === 1 ? 'Job' : 'Jobs'} (
+                      {batchQueue.reduce((acc, it) => acc + it.quantity, 0)} pcs)
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                    Combine multiple prints, plates, or separate files into one itemized PDF quotation or workshop report
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                {/* PDF Type Toggle */}
+                <div className="hidden sm:flex rounded-lg bg-slate-100 dark:bg-slate-800 p-0.5 text-[11px] font-semibold border border-slate-200 dark:border-slate-700">
+                  <button
+                    type="button"
+                    onClick={() => setPdfDocType('workshop')}
+                    className={`py-1 px-2.5 rounded-md transition-colors cursor-pointer text-center ${
+                      pdfDocType === 'workshop'
+                        ? 'bg-amber-500 text-slate-950 shadow-xs'
+                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                    }`}
+                  >
+                    Workshop Report
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPdfDocType('quote')}
+                    className={`py-1 px-2.5 rounded-md transition-colors cursor-pointer text-center ${
+                      pdfDocType === 'quote'
+                        ? 'bg-amber-500 text-slate-950 shadow-xs'
+                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
+                    }`}
+                  >
+                    Client Quote
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setShowBatchModal(false)}
+                  className="w-8 h-8 rounded-lg border border-slate-200 dark:border-slate-800 text-slate-400 hover:text-slate-700 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 flex items-center justify-center transition-colors cursor-pointer text-sm font-bold"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            {/* Quick Actions Bar */}
+            <div className="px-4 sm:px-6 py-2.5 border-b border-slate-200 dark:border-slate-800 bg-slate-100/50 dark:bg-slate-900/50 flex flex-wrap items-center justify-between gap-2 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => handleAddToBatch(displayedGcodeData)}
+                  className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-amber-500 text-slate-800 dark:text-slate-200 font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5 text-amber-500" />
+                  <span>Add Active Print ({displayedGcodeData.fileName.slice(0, 16)}...)</span>
+                </button>
+
+                {gcodeData.plates && gcodeData.plates.length > 1 && (
+                  <button
+                    type="button"
+                    onClick={handleAddAllPlatesToBatch}
+                    className="px-2.5 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400 font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <Layers className="w-3.5 h-3.5" />
+                    <span>Add All {gcodeData.plates.length} Plates</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="px-2.5 py-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:border-amber-500 text-slate-700 dark:text-slate-300 font-medium flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  <Upload className="w-3.5 h-3.5 text-slate-400" />
+                  <span>Upload More Files (.gcode, .3mf)</span>
+                </button>
+              </div>
+
+              {batchQueue.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleClearBatch}
+                  className="text-rose-500 hover:text-rose-600 dark:hover:text-rose-400 font-medium flex items-center gap-1 transition-colors cursor-pointer text-xs"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Clear All</span>
+                </button>
+              )}
+            </div>
+
+            {/* Scrollable Items List */}
+            <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-3">
+              {batchQueue.length === 0 ? (
+                <div className="py-12 px-4 text-center border-2 border-dashed border-slate-200 dark:border-slate-800 rounded-2xl">
+                  <Layers className="w-12 h-12 text-slate-300 dark:text-slate-600 mx-auto mb-3" />
+                  <h3 className="text-sm sm:text-base font-bold text-slate-800 dark:text-slate-200">
+                    Your Multi-Print Batch is Empty
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto mt-1 leading-relaxed">
+                    Add prints or plates to this queue, adjust order quantities, and generate an itemized consolidated PDF for your clients or workshop records.
+                  </p>
+                  <div className="flex flex-wrap items-center justify-center gap-2 mt-4">
+                    <button
+                      type="button"
+                      onClick={() => handleAddToBatch(displayedGcodeData)}
+                      className="px-3.5 py-2 text-xs font-bold rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 transition-colors cursor-pointer"
+                    >
+                      + Add Active Print to Batch
+                    </button>
+                    {gcodeData.plates && gcodeData.plates.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={handleAddAllPlatesToBatch}
+                        className="px-3.5 py-2 text-xs font-semibold rounded-lg bg-slate-800 hover:bg-slate-700 text-white border border-slate-700 transition-colors cursor-pointer"
+                      >
+                        + Add All {gcodeData.plates.length} Plates from Project
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                batchQueue.map((item, idx) => {
+                  const activePowerProfile =
+                    ELEGOO_CC2_POWER_PROFILES.find((p) => p.id === inputs.powerProfileId) ||
+                    ELEGOO_CC2_POWER_PROFILES[0];
+                  const itemReport = calculatePrintEconomics(item.gcodeData, inputs, activePowerProfile, wearComponents);
+                  const unitPrice = pdfDocType === 'quote' ? itemReport.suggestedQuotePrice : itemReport.totalManufacturingCost;
+                  const itemTotalPrice = unitPrice * item.quantity;
+                  const itemTotalTime = item.gcodeData.printTimeSeconds * item.quantity;
+                  const itemTotalGrams = item.gcodeData.filamentWeightGrams * item.quantity;
+                  const colorSlot = item.gcodeData.filamentSlots[0];
+
+                  return (
+                    <div
+                      key={item.id}
+                      className="p-3.5 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950/40 hover:border-amber-500/50 transition-colors flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                    >
+                      {/* Left: Thumbnail & Name */}
+                      <div className="flex items-center gap-3 min-w-0 flex-1">
+                        <span className="text-xs font-mono font-bold text-slate-400 w-5 shrink-0">
+                          #{idx + 1}
+                        </span>
+
+                        <div className="w-12 h-12 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-center overflow-hidden shrink-0">
+                          {item.thumbnailBase64 ? (
+                            <img
+                              src={item.thumbnailBase64}
+                              alt={item.name}
+                              className="w-full h-full object-contain"
+                            />
+                          ) : (
+                            <Layers className="w-5 h-5 text-slate-400" />
+                          )}
+                        </div>
+
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs sm:text-sm font-bold text-slate-900 dark:text-white truncate">
+                            {item.name}
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2 mt-0.5 text-[11px] text-slate-500 dark:text-slate-400 font-mono">
+                            {colorSlot ? (
+                              <span className="inline-flex items-center gap-1">
+                                <span
+                                  className="w-2.5 h-2.5 rounded-full border border-slate-400"
+                                  style={{ backgroundColor: colorSlot.colorHex }}
+                                />
+                                <span>{colorSlot.type}</span>
+                              </span>
+                            ) : (
+                              <span>{item.gcodeData.filamentType || 'PLA'}</span>
+                            )}
+                            <span>·</span>
+                            <span>{formatDuration(item.gcodeData.printTimeSeconds)} / ea</span>
+                            <span>·</span>
+                            <span>{item.gcodeData.filamentWeightGrams.toFixed(1)}g / ea</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Middle: Quantity Stepper */}
+                      <div className="flex items-center gap-3 shrink-0 self-end sm:self-center">
+                        <div className="flex items-center rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 overflow-hidden">
+                          <button
+                            type="button"
+                            onClick={() => handleUpdateBatchQuantity(item.id, -1)}
+                            disabled={item.quantity <= 1}
+                            className="px-2.5 py-1 text-xs font-bold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-40 cursor-pointer"
+                          >
+                            -
+                          </button>
+                          <input
+                            type="number"
+                            min="1"
+                            value={item.quantity}
+                            onChange={(e) => handleSetBatchQuantity(item.id, parseInt(e.target.value, 10) || 1)}
+                            className="w-12 py-1 text-center font-mono text-xs font-bold bg-transparent border-0 focus:outline-hidden"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleUpdateBatchQuantity(item.id, 1)}
+                            className="px-2.5 py-1 text-xs font-bold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+                          >
+                            +
+                          </button>
+                        </div>
+
+                        {/* Right: Subtotal & Delete */}
+                        <div className="text-right min-w-[90px]">
+                          <div className="text-xs sm:text-sm font-bold font-mono text-amber-600 dark:text-amber-400">
+                            {sym}{itemTotalPrice.toFixed(2)}
+                          </div>
+                          <div className="text-[10px] font-mono text-slate-500 dark:text-slate-400">
+                            {formatDuration(itemTotalTime)} · {itemTotalGrams.toFixed(1)}g
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveFromBatch(item.id)}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-rose-500 hover:bg-rose-500/10 transition-colors cursor-pointer"
+                          title="Remove item"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {/* Sticky Summary & Export Footer */}
+            {batchQueue.length > 0 && (() => {
+              const activePowerProfile =
+                ELEGOO_CC2_POWER_PROFILES.find((p) => p.id === inputs.powerProfileId) ||
+                ELEGOO_CC2_POWER_PROFILES[0];
+              const batchCalculations = batchQueue.map((item) => {
+                const qty = Math.max(1, item.quantity);
+                const rep = calculatePrintEconomics(item.gcodeData, inputs, activePowerProfile, wearComponents);
+                const unitPrice = pdfDocType === 'quote' ? rep.suggestedQuotePrice : rep.totalManufacturingCost;
+                return {
+                  qty,
+                  unitPrice,
+                  totalPrice: unitPrice * qty,
+                  totalTimeSecs: item.gcodeData.printTimeSeconds * qty,
+                  totalWeightGrams: item.gcodeData.filamentWeightGrams * qty,
+                  totalKwh: rep.totalKwh * qty
+                };
+              });
+              const totalBatchPrice = batchCalculations.reduce((a, b) => a + b.totalPrice, 0);
+              const totalBatchTimeSecs = batchCalculations.reduce((a, b) => a + b.totalTimeSecs, 0);
+              const totalBatchWeightGrams = batchCalculations.reduce((a, b) => a + b.totalWeightGrams, 0);
+              const totalBatchKwh = batchCalculations.reduce((a, b) => a + b.totalKwh, 0);
+              const totalPartsCount = batchCalculations.reduce((a, b) => a + b.qty, 0);
+
+              return (
+                <div className="p-4 sm:px-6 border-t border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-950/80 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                      <div>
+                        <span className="text-slate-500 dark:text-slate-400 block text-[10px]">Total Parts</span>
+                        <strong className="font-mono text-slate-900 dark:text-white">{totalPartsCount} pcs</strong>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 dark:text-slate-400 block text-[10px]">Total Print Run</span>
+                        <strong className="font-mono text-slate-900 dark:text-white">{formatDuration(totalBatchTimeSecs)}</strong>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 dark:text-slate-400 block text-[10px]">Total Material</span>
+                        <strong className="font-mono text-slate-900 dark:text-white">{totalBatchWeightGrams.toFixed(1)}g</strong>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 dark:text-slate-400 block text-[10px]">Electrical Draw</span>
+                        <strong className="font-mono text-slate-900 dark:text-white">{totalBatchKwh.toFixed(2)} kWh</strong>
+                      </div>
+                    </div>
+
+                    <div className="text-right">
+                      <div className="text-[10px] font-bold text-amber-600 dark:text-amber-400 tracking-wider">
+                        {pdfDocType === 'quote' ? 'TOTAL CLIENT QUOTATION' : 'TOTAL PRODUCTION COST'}
+                      </div>
+                      <div className="text-xl sm:text-2xl font-bold font-mono tabular-nums text-slate-900 dark:text-white">
+                        {sym}{totalBatchPrice.toFixed(2)}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+                    <div className="text-xs text-slate-500 dark:text-slate-400">
+                      {costFolderName ? (
+                        <span>Saving directly to: <strong className="text-slate-700 dark:text-slate-200 font-mono">Desktop\{costFolderName}</strong></span>
+                      ) : (
+                        <span>PDF will download directly to your device</span>
+                      )}
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowBatchModal(false)}
+                        className="px-4 py-2 text-xs font-semibold rounded-lg border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+                      >
+                        Back to App
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleExportBatchPdf}
+                        disabled={isExportingPdf}
+                        className="px-5 py-2 text-xs font-bold rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
+                      >
+                        <FileText className="w-4 h-4" />
+                        <span>
+                          {isExportingPdf
+                            ? 'Generating PDF...'
+                            : costFolderName
+                            ? `Save ${pdfDocType === 'quote' ? 'Batch Quote' : 'Batch Report'} to "${costFolderName}"`
+                            : `Export Multi-Print ${pdfDocType === 'quote' ? 'Quotation' : 'Report'} PDF`}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}

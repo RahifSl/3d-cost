@@ -19,6 +19,42 @@ export interface FilamentSlotInfo {
   slicerCost: number;
 }
 
+export interface PrintBedPlate {
+  id: string;
+  index: number;
+  name: string;
+  thumbnailBase64?: string | null;
+  printTimeSeconds: number;
+  filamentWeightGrams: number;
+  flushedFilamentGrams?: number;
+  towerFilamentGrams?: number;
+  filamentSlots: FilamentSlotInfo[];
+  gcodeData: ParsedGcodeData;
+}
+
+export interface BatchPrintItem {
+  id: string;
+  name: string;
+  fileName: string;
+  plateName?: string;
+  thumbnailBase64?: string | null;
+  gcodeData: ParsedGcodeData;
+  quantity: number;
+  addedAt: number;
+}
+
+export interface SavedModelItem {
+  id: string;
+  fileName: string;
+  displayName: string;
+  importedAt: number;
+  fileSizeBytes: number;
+  format: '3mf' | 'gcode';
+  thumbnailBase64: string | null;
+  parsedData: ParsedGcodeData;
+  platesCount?: number;
+}
+
 export interface ParsedGcodeData {
   fileName: string;
   fileSizeBytes: number;
@@ -63,6 +99,8 @@ export interface ParsedGcodeData {
     extrusionMm: number;
     speedMmS: number;
   }[];
+  plates?: PrintBedPlate[];
+  is3mf?: boolean;
 }
 
 export interface PowerProfile {
@@ -101,4 +139,5 @@ export interface SampleGcodePreset {
   subtitle: string;
   fileName: string;
   gcodeContent: string;
+  plates?: PrintBedPlate[];
 }

@@ -19,15 +19,7 @@ const jsFile = scriptMatch
 const cssContent = cssFile ? fs.readFileSync(path.join(assetsDir, cssFile), 'utf8') : '';
 let jsContent = jsFile ? fs.readFileSync(path.join(assetsDir, jsFile), 'utf8') : '';
 
-// Inline the Kit Card Winter House plate image as base64 data URL so the single HTML file has zero external image dependencies
-const winterHousePngPath = path.join(publicDir, 'kit_card_winter_house_plate.png');
-if (fs.existsSync(winterHousePngPath)) {
-  const b64 = fs.readFileSync(winterHousePngPath).toString('base64');
-  const dataUrl = `data:image/png;base64,${b64}`;
-  jsContent = jsContent.split('/kit_card_winter_house_plate.png').join(dataUrl);
-}
-
-// Inline icon.svg as base64 favicon
+// Use a lightweight SVG placeholder or external path for sample presets if needed
 const iconSvgPath = path.join(publicDir, 'icon.svg');
 const iconDataUrl = fs.existsSync(iconSvgPath)
   ? `data:image/svg+xml;base64,${fs.readFileSync(iconSvgPath).toString('base64')}`
@@ -41,6 +33,11 @@ if (iconDataUrl) {
   html = html.split('href="/icon.svg"').join(`href="${iconDataUrl}"`);
 }
 
+// Replace import.meta with safe location fallback so the script runs cleanly as a classic script in WebView2 / about:blank
+jsContent = jsContent.replaceAll('import.meta.url', 'window.location.href');
+jsContent = jsContent.replaceAll('import.meta.resolve', 'undefined');
+jsContent = jsContent.replace(/\bimport\.meta\b/g, '({ url: window.location.href })');
+
 // Safely escape any closing script tags inside JS bundle
 const safeJsContent = jsContent.split('</script>').join('<\\/script>');
 
@@ -48,7 +45,7 @@ const safeJsContent = jsContent.split('</script>').join('<\\/script>');
 html = html.split('</head>').join(`  <style>${cssContent}</style>\n</head>`);
 html = html
   .split('<div id="root"></div>')
-  .join(`<div id="root"></div>\n  <script type="module">\n${safeJsContent}\n</script>`);
+  .join(`<div id="root"></div>\n  <script>\n${safeJsContent}\n</script>`);
 
 const outPath = path.join(publicDir, 'Elegoo_CC2_Cost_Calculator_Offline.html');
 fs.writeFileSync(outPath, html, 'utf8');

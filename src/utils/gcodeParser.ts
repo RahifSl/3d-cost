@@ -216,6 +216,7 @@ export function parseGcodeFile(content: string, fileName: string, fileSizeBytes?
   let thumbnailBuffer: string[] = [];
   let bestThumbnailBase64: string | null = null;
   let bestThumbnailRawLen = 0;
+  const detectedObjectNames: string[] = [];
 
   // Store continuous extrusion segments for accurate 2D/3D model rendering
   const segments: ExtrusionSegment[] = [];
@@ -275,10 +276,34 @@ export function parseGcodeFile(content: string, fileName: string, fileSizeBytes?
       continue;
     }
 
+    // Check exclude object define for exact model naming
+    const exclMatch = line.match(/EXCLUDE_OBJECT_DEFINE\s+NAME=["']?([^"'\s;]+)["']?/i);
+    if (exclMatch) {
+      const cleanName = exclMatch[1]
+        .replace(/_id_\d+_copy_\d+$/i, '')
+        .replace(/\.(stl|3mf|obj|step)$/i, '')
+        .replace(/^obj_\d+_/i, '')
+        .trim();
+      if (cleanName && !detectedObjectNames.includes(cleanName)) {
+        detectedObjectNames.push(cleanName);
+      }
+    }
+
     // Track feature types & tool changes in comments
     if (line.startsWith(';')) {
       const comment = line.slice(1).trim();
       const lower = comment.toLowerCase();
+
+      if (lower.startsWith('printing object')) {
+        const objName = comment
+          .replace(/^printing object\s+/i, '')
+          .replace(/\s+id:\d+\s+copy\s+\d+$/i, '')
+          .replace(/\.(stl|3mf|obj|step)$/i, '')
+          .trim();
+        if (objName && !detectedObjectNames.includes(objName)) {
+          detectedObjectNames.push(objName);
+        }
+      }
 
       if (lower === 'wipe_start') {
         isWiping = true;
@@ -808,8 +833,22 @@ export function parseGcodeFile(content: string, fileName: string, fileSizeBytes?
     }
   }
 
+  let resolvedFileName = fileName;
+  if (/^\.\d+\.\d+\.gcode$/i.test(fileName) || fileName === 'OrcaSlicer_Plate.gcode' || fileName === 'Sliced_Plate.gcode') {
+    if (detectedObjectNames.length > 0) {
+      resolvedFileName =
+        detectedObjectNames.length === 1
+          ? `${detectedObjectNames[0]}.gcode`
+          : `${detectedObjectNames[0]} (+${detectedObjectNames.length - 1} parts).gcode`;
+    } else {
+      const plateNumMatch = fileName.match(/\.(\d+)\.gcode$/i);
+      const plateIdx = plateNumMatch ? parseInt(plateNumMatch[1], 10) + 1 : 1;
+      resolvedFileName = `Sliced_Plate_${plateIdx}.gcode`;
+    }
+  }
+
   return {
-    fileName,
+    fileName: resolvedFileName,
     fileSizeBytes: fileSizeBytes ?? new Blob([content]).size,
     slicerName,
     printerModel,

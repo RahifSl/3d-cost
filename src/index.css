@@ -8,12 +8,35 @@
 }
 
 @layer base {
+  html {
+    overflow-x: hidden;
+    scroll-behavior: smooth;
+  }
   body {
     font-family: var(--font-sans);
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    overflow-x: hidden;
+    min-height: 100vh;
+    background-color: #f8fafc;
+  }
+  .dark body, html.dark body {
+    background-color: #020617;
+  }
+  #root {
+    min-height: 100vh;
+    overflow-x: hidden;
   }
 
   h1, h2, h3, h4, .font-display {
     font-family: var(--font-display);
   }
+}
+
+/* Hide scrollbar for clean horizontal nav bars */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
 }
